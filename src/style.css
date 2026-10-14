@@ -1,0 +1,134 @@
+html, body {
+  margin: 0;
+  padding: 0;
+  background-color: #0f111a;
+  color: #c3ccdb;
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
+  box-sizing: border-box;
+}
+
+*, *::before, *::after {
+  box-sizing: inherit;
+}
+
+/* Custom scrollbars */
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+::-webkit-scrollbar-track {
+  background: #141721;
+}
+::-webkit-scrollbar-thumb {
+  background: #2b3145;
+  border-radius: 4px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: #3d4561;
+}
+
+/* Table styling */
+.entry-row {
+  cursor: pointer;
+  border-bottom: 1px solid #1a1e2b;
+  transition: background-color 0.15s ease;
+}
+
+.entry-row:hover {
+  background-color: #1e2436;
+}
+
+.entry-row.selected {
+  background-color: #27314a !important;
+  outline: 1px solid #82aaff;
+}
+
+/* Buttons and Controls */
+.btn {
+  background: #22283a;
+  border: 1px solid #363e58;
+  color: #c3ccdb;
+  padding: 5px 12px;
+  font-family: inherit;
+  font-size: 12px;
+  border-radius: 4px;
+  cursor: pointer;
+  transition: all 0.15s ease;
+}
+
+.btn:hover:not(:disabled) {
+  background: #2e3750;
+  border-color: #82aaff;
+  color: #fff;
+}
+
+.btn:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+.tab-btn {
+  background: transparent;
+  border: 1px solid transparent;
+  color: #7982a9;
+  padding: 4px 10px;
+  font-family: inherit;
+  font-size: 12px;
+  border-radius: 4px;
+  cursor: pointer;
+  transition: all 0.15s ease;
+}
+
+.tab-btn:hover {
+  color: #c3ccdb;
+  background: #1c202e;
+}
+
+.tab-btn.active {
+  background: #232a3d;
+  color: #82aaff;
+  border-color: #363e58;
+  font-weight: bold;
+}
+
+.nav-tab {
+  background: transparent;
+  border: 1px solid transparent;
+  color: #7982a9;
+  padding: 8px 16px;
+  font-family: inherit;
+  font-size: 13px;
+  border-radius: 6px;
+  cursor: pointer;
+  transition: all 0.15s ease;
+}
+
+.nav-tab:hover {
+  color: #c3ccdb;
+  background: #191c28;
+}
+
+.nav-tab.active {
+  background: #1f2537;
+  color: #82aaff;
+  border-color: #363e58;
+  font-weight: bold;
+}
+
+
+
+.input-num {
+  background: #151822;
+  border: 1px solid #363e58;
+  color: #c3ccdb;
+  padding: 4px 8px;
+  font-family: inherit;
+  font-size: 12px;
+  border-radius: 4px;
+  width: 70px;
+}
+
+.input-num:focus {
+  outline: none;
+  border-color: #82aaff;
+}

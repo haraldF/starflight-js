@@ -5,12 +5,13 @@ import { SystemVisualizer } from './system-visualizer';
 import { createForthEngine, type ForthEngine } from './forth-decompiler';
 import { ForthExplorer } from './forth-explorer';
 import { KernelDisassembler } from './kernel-disassembler';
+import { ForthBootRunner } from './forth-boot';
 
 const RECORDS_PER_PAGE = 20;
 const RAW_CHUNK_SIZE = 512;
 
 type FilterMode = 'all' | 'mapped' | 'virtual' | 'pad';
-type ActiveTab = 'explorer' | 'systems' | 'forth' | 'kernel';
+type ActiveTab = 'explorer' | 'systems' | 'forth' | 'kernel' | 'game';
 
 async function loadStar(url: string): Promise<ArrayBuffer> {
   const response = await fetch(url);
@@ -429,18 +430,66 @@ export class ExplorerApp {
   }
 }
 
+class GameScreen {
+  private runner: ForthBootRunner;
+
+  constructor(forthEngine: ForthEngine, starflt: Uint8Array) {
+    this.runner = new ForthBootRunner(forthEngine, starflt);
+  }
+
+  mount(target: HTMLElement) {
+    target.innerHTML = `
+      <div class="game-view">
+        <canvas class="game-canvas" width="320" height="200" role="img" aria-label="Starflight game screen, 320 by 200 pixels"></canvas>
+        <section class="boot-console">
+          <div class="boot-controls">
+            <button id="run-forth-boot" class="btn" type="button">Run Forth Boot</button>
+            <span>Entry: W_0x0937 · 16-bit cells · 64K memory</span>
+          </div>
+          <div id="forth-boot-status" role="status">Ready to start from the first Forth CFA.</div>
+          <pre id="forth-boot-trace">Boot trace will appear here.</pre>
+        </section>
+      </div>
+    `;
+
+    const canvas = this.containerCanvas(target);
+    if (!canvas) return;
+    const context = canvas.getContext('2d');
+    if (!context) return;
+    context.fillStyle = '#000000';
+    context.fillRect(0, 0, canvas.width, canvas.height);
+
+    target.querySelector('#run-forth-boot')?.addEventListener('click', () => {
+      const result = this.runner.run();
+      const status = target.querySelector<HTMLElement>('#forth-boot-status');
+      const trace = target.querySelector<HTMLElement>('#forth-boot-trace');
+      if (status) status.textContent = `${result.steps} threaded steps · ${result.stopReason}`;
+      if (trace) {
+        const output = result.output ? `Output: ${result.output}\n\n` : '';
+        trace.textContent = `${output}${result.trace.join('\n')}`;
+      }
+    });
+  }
+
+  private containerCanvas(target: HTMLElement): HTMLCanvasElement | null {
+    return target.querySelector<HTMLCanvasElement>('.game-canvas');
+  }
+}
+
 class MainApp {
-  private activeTab: ActiveTab = 'systems'; // Start with the star system visualizer!
+  private activeTab: ActiveTab = 'game';
   private explorerApp: ExplorerApp;
   private systemVisualizer: SystemVisualizer;
   private forthExplorer: ForthExplorer;
   private kernelDisassembler: KernelDisassembler;
+  private gameScreen: GameScreen;
 
   constructor(fs: StarflightFS, systems: StarSystemInfo[], forthEngine: ForthEngine, starflt: Uint8Array) {
     this.explorerApp = new ExplorerApp(fs);
     this.systemVisualizer = new SystemVisualizer(systems);
     this.forthExplorer = new ForthExplorer(forthEngine);
     this.kernelDisassembler = new KernelDisassembler(starflt);
+    this.gameScreen = new GameScreen(forthEngine, starflt);
   }
 
 
@@ -461,6 +510,9 @@ class MainApp {
 
           <!-- Top Navigation Tabs -->
           <nav style="display: flex; gap: 8px;">
+            <button id="nav-btn-game" class="nav-tab ${this.activeTab === 'game' ? 'active' : ''}">
+              Game
+            </button>
             <button id="nav-btn-systems" class="nav-tab ${this.activeTab === 'systems' ? 'active' : ''}">
               &#9733; Star Systems & Galaxy
             </button>
@@ -498,6 +550,10 @@ class MainApp {
       this.switchTab('kernel');
     });
 
+    document.getElementById('nav-btn-game')?.addEventListener('click', () => {
+      this.switchTab('game');
+    });
+
     this.renderCurrentTab();
   }
 
@@ -523,9 +579,12 @@ class MainApp {
     } else if (this.activeTab === 'forth') {
       this.systemVisualizer.destroy();
       this.forthExplorer.mount(content);
-    } else {
+    } else if (this.activeTab === 'kernel') {
       this.systemVisualizer.destroy();
       this.kernelDisassembler.mount(content);
+    } else {
+      this.systemVisualizer.destroy();
+      this.gameScreen.mount(content);
     }
   }
 }

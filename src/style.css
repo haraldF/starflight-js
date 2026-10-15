@@ -115,6 +115,56 @@ html, body {
   font-weight: bold;
 }
 
+.game-canvas {
+  display: block;
+  width: min(100%, 960px);
+  height: auto;
+  aspect-ratio: 8 / 5;
+  margin: 0 auto;
+  background: #000;
+  border: 1px solid #363e58;
+  image-rendering: pixelated;
+}
+
+.game-view {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 16px;
+}
+
+.boot-console {
+  width: min(100%, 960px);
+  color: #7982a9;
+  font-size: 12px;
+}
+
+.boot-controls {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 12px;
+  margin-bottom: 8px;
+}
+
+#forth-boot-status {
+  margin-bottom: 8px;
+  line-height: 1.5;
+}
+
+#forth-boot-trace {
+  max-height: 320px;
+  margin: 0;
+  overflow: auto;
+  background: #0c0e17;
+  border: 1px solid #1f2537;
+  border-radius: 6px;
+  padding: 10px 12px;
+  color: #c3ccdb;
+  font: 11px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  white-space: pre;
+}
+
 .forth-workspace {
   grid-template-columns: minmax(320px, 0.8fr) minmax(0, 1.4fr);
 }

@@ -9,7 +9,7 @@
 
 import { STARA_SIZE } from './starflight-fs';
 
-export type ForthWordType = 'colon' | 'variable' | 'constant' | 'user' | 'afield' | 'case' | 'primitive';
+export type ForthWordType = 'colon' | 'variable' | 'constant' | 'user' | 'afield' | 'case' | 'table' | 'primitive';
 
 export interface ForthToken {
   addr: number;
@@ -49,6 +49,7 @@ export const CODE_2LIT = 0x1618;       // (2LIT): push two constants
 export const CODE_AFIELD = 0x744d;     // Instance field / attribute accessor
 export const CODE_LOADDATA = 0x73ea;   // File record / data loader
 export const CODE_CASE = 0x4a4f;       // CCASE: CASE: jump table
+export const CODE_TABLE = 0x5275;      // OVT / IARRAYS parameter table
 
 export const CFA_LIT = 0x175d;         // (LIT): literal constant follows
 export const CFA_0BRANCH = 0x15fa;     // (0BRANCH): conditional jump (IF / UNTIL)
@@ -525,6 +526,10 @@ export async function createForthEngine(
       typeLabel = 'USER Variable';
       const val = kernelMem[w.pfa] | (kernelMem[w.pfa + 1] << 8);
       decompiled = `${val} USER ${w.name}`;
+    } else if (w.codep === CODE_TABLE) {
+      type = 'table';
+      typeLabel = 'Forth parameter table';
+      decompiled = `TABLE ${w.name} (inline data at 0x${w.pfa.toString(16).padStart(4, '0')})`;
     } else {
       decompiled = `CODE ${w.name} [codep: 0x${w.codep.toString(16)}]`;
     }
@@ -581,6 +586,10 @@ export async function createForthEngine(
       type = 'case';
       typeLabel = 'CASE: Jump Table';
       decompiled = `CASE: ${w.name}`;
+    } else if (w.codep === CODE_TABLE) {
+      type = 'table';
+      typeLabel = 'Forth parameter table';
+      decompiled = `TABLE ${w.name} (inline data at 0x${w.pfa.toString(16).padStart(4, '0')})`;
     } else {
       decompiled = `CODE ${w.name} [codep: 0x${w.codep.toString(16)}]`;
     }

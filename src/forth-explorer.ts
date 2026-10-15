@@ -107,6 +107,7 @@ export class ForthExplorer {
               <option value="constant">CONSTANT</option>
               <option value="variable">VARIABLE</option>
               <option value="afield">AFIELD (Instance Records)</option>
+              <option value="table">Forth Parameter Tables</option>
               <option value="primitive">CODE (Machine Primitives)</option>
             </select>
 

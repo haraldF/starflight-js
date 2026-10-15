@@ -5,6 +5,7 @@ import {
   CFA_EXIT2,
   CODE_CALL,
   CODE_CONSTANT,
+  CODE_TABLE,
   CODE_USER,
   CODE_VARIABLE,
   type ForthEngine,
@@ -22,6 +23,10 @@ interface LoopFrame {
   index: number;
   limit: number;
   returnStackBase: number;
+}
+
+function toSignedCell(value: number): number {
+  return (value << 16) >> 16;
 }
 
 export interface ForthBootResult {
@@ -175,6 +180,19 @@ export class ForthBootRunner {
           break;
         }
 
+        if (target.codep === CODE_TABLE) {
+          const tableIndex = pop(dataStack, 'data');
+          const entryAddress = target.pfa + tableIndex * 2;
+          if (entryAddress < 0 || entryAddress + 1 >= this.memory.length) {
+            stopReason = `Table index ${tableIndex} is outside ${target.name} at PFA ${target.pfaHex}.`;
+            break;
+          }
+          const entry = readWord(entryAddress);
+          push(dataStack, entry);
+          trace.push(this.formatTrace(steps, frame.word, token, dataStack, `${target.name}[${tableIndex}] = 0x${entry.toString(16).padStart(4, '0')}`));
+          continue;
+        }
+
         if (target.type === 'constant') {
           push(dataStack, readWord(target.pfa));
           trace.push(this.formatTrace(steps, frame.word, token, dataStack, `constant ${target.name}`));
@@ -224,7 +242,7 @@ export class ForthBootRunner {
           const loop = loops[loopIndex];
           loop.index = (loop.index + step) & 0xffff;
           returnStack[loop.returnStackBase + 1] = loop.index;
-          const relative = (branchData.cfa << 16) >> 16;
+          const relative = toSignedCell(branchData.cfa);
           const doAddress = (token.addr + relative) & 0xffff;
           const doTokenIndex = frame.word.tokens.findIndex(candidate => candidate.addr === doAddress);
           frame.tokenIndex++;
@@ -332,30 +350,53 @@ export class ForthBootRunner {
       const left = pop(dataStack, 'data');
       push(dataStack, operation(left, right));
     };
+    const unary = (operation: (value: number) => number) => {
+      push(dataStack, operation(pop(dataStack, 'data')));
+    };
 
-    if (word.codep === 0x4873) {
-      writeWord(pop(dataStack, 'data'), 1);
-      return { supported: true, note: 'native ON: set flag to one', output };
-    }
-    if (word.codep === 0x4886) {
-      writeWord(pop(dataStack, 'data'), 0);
-      return { supported: true, note: 'native OFF: clear flag', output };
-    }
-    if (word.codep === 0x0d10) {
-      const count = pop(dataStack, 'data');
-      const destination = pop(dataStack, 'data');
-      const source = pop(dataStack, 'data');
-      const copy = new Uint8Array(count);
-      for (let index = 0; index < count; index++) copy[index] = this.memory[(source + index) & 0xffff];
-      for (let index = 0; index < count; index++) this.memory[(destination + index) & 0xffff] = copy[index];
-      return { supported: true, note: `native CMOVE_2: copy ${count} bytes`, output };
-    }
-    if (word.codep === 0x0d35) {
-      const value = pop(dataStack, 'data') & 0xff;
-      const count = pop(dataStack, 'data');
-      const destination = pop(dataStack, 'data');
-      for (let index = 0; index < count; index++) this.memory[(destination + index) & 0xffff] = value;
-      return { supported: true, note: `native FILL_2: fill ${count} bytes`, output };
+    switch (word.codep) {
+      case 0x4873: // ON
+        writeWord(pop(dataStack, 'data'), 1);
+        return { supported: true, note: 'native ON: set flag to one', output };
+      case 0x4886: // OFF
+        writeWord(pop(dataStack, 'data'), 0);
+        return { supported: true, note: 'native OFF: clear flag', output };
+      case 0x0d7c: { // SEG>ADDR
+        const segment = pop(dataStack, 'data');
+        push(dataStack, (segment - 0x0192) * 16);
+        return { supported: true, note: 'convert segment to address relative to CS', output };
+      }
+      case 0x0d10: { // CMOVE_2
+        const count = pop(dataStack, 'data');
+        const destination = pop(dataStack, 'data');
+        const source = pop(dataStack, 'data');
+        const copy = new Uint8Array(count);
+        for (let index = 0; index < count; index++) copy[index] = this.memory[(source + index) & 0xffff];
+        for (let index = 0; index < count; index++) this.memory[(destination + index) & 0xffff] = copy[index];
+        return { supported: true, note: `native CMOVE_2: copy ${count} bytes`, output };
+      }
+      case 0x0d35: { // FILL_2
+        const value = pop(dataStack, 'data') & 0xff;
+        const count = pop(dataStack, 'data');
+        const destination = pop(dataStack, 'data');
+        for (let index = 0; index < count; index++) this.memory[(destination + index) & 0xffff] = value;
+        return { supported: true, note: `native FILL_2: fill ${count} bytes`, output };
+      }
+      case 0x4da4: { // !OFFSET
+        const descriptor = pop(dataStack, 'data');
+        const multiplier = readWord(descriptor);
+        let count = readWord(descriptor + 2);
+        const baseOffset = readWord(descriptor + 4);
+        const segment = readWord(descriptor + 6);
+        let destination = (baseOffset + count * 2) & 0xffff;
+        do {
+          writeFarWord(segment, destination, multiplier * count);
+          destination = (destination - 2) & 0xffff;
+          count = (count - 1) & 0xffff;
+        } while (count !== 0);
+        writeFarWord(segment, destination, 0);
+        return { supported: true, note: 'build 2D-array offset table', output };
+      }
     }
 
     switch (name) {
@@ -394,8 +435,7 @@ export class ForthBootRunner {
       }
       case '?UPDATE': {
         const address = pop(dataStack, 'data');
-        const signed = (value: number) => (value << 16) >> 16;
-        const signedAddress = signed(address);
+        const signedAddress = toSignedCell(address);
         if (signedAddress >= 0) {
           if (signedAddress >= 0x63ef && signedAddress < 0x64fd) this.memory[0x63ee] = 0xff;
         } else {
@@ -403,7 +443,7 @@ export class ForthBootRunner {
             const buffer = readWord(bufferAddress);
             const start = (buffer + 7) & 0xffff;
             const end = (start + 0x401) & 0xffff;
-            if (signedAddress > signed(start) && signedAddress < signed(end)) {
+            if (signedAddress > toSignedCell(start) && signedAddress < toSignedCell(end)) {
               this.memory[(buffer + 2) & 0xffff] = 0xff;
               break;
             }
@@ -492,14 +532,14 @@ export class ForthBootRunner {
         return { supported: true, note: 'subtract', output };
       case '/':
         binary((left, right) => {
-          const dividend = (left << 16) >> 16;
-          const divisor = (right << 16) >> 16;
+          const dividend = toSignedCell(left);
+          const divisor = toSignedCell(right);
           if (divisor === 0) throw new RangeError('Forth division by zero');
           return Math.trunc(dividend / divisor);
         });
         return { supported: true, note: 'signed divide', output };
       case '0=':
-        push(dataStack, pop(dataStack, 'data') === 0 ? 1 : 0);
+        unary(value => value === 0 ? 1 : 0);
         return { supported: true, note: 'zero test', output };
       case '=':
         binary((left, right) => left === right ? 1 : 0);
@@ -511,8 +551,11 @@ export class ForthBootRunner {
         binary((left, right) => Math.min(left, right));
         return { supported: true, note: 'unsigned minimum', output };
       case '<':
-        binary((left, right) => ((left << 16) >> 16) < ((right << 16) >> 16) ? 1 : 0);
+        binary((left, right) => toSignedCell(left) < toSignedCell(right) ? 1 : 0);
         return { supported: true, note: 'signed less-than', output };
+      case '>':
+        binary((left, right) => toSignedCell(left) > toSignedCell(right) ? 1 : 0);
+        return { supported: true, note: 'signed greater-than', output };
       case '(CS?)':
       case '@DS':
         push(dataStack, 0x0192);
@@ -558,17 +601,23 @@ export class ForthBootRunner {
         return { supported: false, note: `unsupported interrupt 0x${interrupt.toString(16).padStart(2, '0')} AX=0x${ax.toString(16).padStart(4, '0')}`, output };
       }
       case '2+':
-        push(dataStack, pop(dataStack, 'data') + 2);
+        unary(value => value + 2);
         return { supported: true, note: 'add two', output };
       case '2*':
-        push(dataStack, pop(dataStack, 'data') * 2);
+        unary(value => value * 2);
         return { supported: true, note: 'multiply by two', output };
+      case '16/':
+        unary(value => value >>> 4);
+        return { supported: true, note: 'divide unsigned value by 16', output };
       case '1+':
-        push(dataStack, pop(dataStack, 'data') + 1);
+        unary(value => value + 1);
         return { supported: true, note: 'increment', output };
       case '1-':
-        push(dataStack, pop(dataStack, 'data') - 1);
+        unary(value => value - 1);
         return { supported: true, note: 'decrement', output };
+      case 'NEGATE':
+        unary(value => -value);
+        return { supported: true, note: 'negate signed cell', output };
       case 'DUP': {
         const value = pop(dataStack, 'data');
         push(dataStack, value);

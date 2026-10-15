@@ -606,62 +606,58 @@ export async function createForthEngine(
     });
   }
 
-  const referencedModulesByCfa = new Map<number, Set<string>>();
-  for (const word of parsedWords) {
-    for (const token of word.tokens) {
-      const modules = referencedModulesByCfa.get(token.cfa) ?? new Set<string>();
-      modules.add(word.module);
-      referencedModulesByCfa.set(token.cfa, modules);
-    }
-  }
   const parsedWordKeys = new Set(parsedWords.map(word => `${word.module}:${word.cfa}`));
-  for (const [cfa, sourceModules] of referencedModulesByCfa) {
-    const candidates = Array.from(discoveredHeaders.values())
-      .map(headers => headers.get(cfa))
-      .filter((header): header is NonNullable<typeof header> => header !== undefined);
-    const contextualCandidates = candidates.filter(header => sourceModules.has(header.module));
-    const header = contextualCandidates.length === 1
-      ? contextualCandidates[0]
-      : (contextualCandidates.length === 0 && candidates.length === 1 ? candidates[0] : undefined);
-    const anonymousCandidates = header ? [] : memoryRegions.filter(region =>
-      cfa >= region.start && cfa + 1 < region.end && hasValidUnresolvedColonBody(region, cfa)
-    );
-    const contextualAnonymousCandidates = anonymousCandidates.filter(region => sourceModules.has(region.module));
-    const anonymousRegion = contextualAnonymousCandidates.length === 1
-      ? contextualAnonymousCandidates[0]
-      : (contextualAnonymousCandidates.length === 0 && anonymousCandidates.length === 1 ? anonymousCandidates[0] : undefined);
-    const module = header?.module ?? anonymousRegion?.module;
-    const mem = header?.mem ?? anonymousRegion?.mem;
-    const codep = header?.codep ?? (anonymousRegion ? CODE_CALL : undefined);
-    if (!module || !mem || codep === undefined) continue;
+  for (let wordIndex = 0; wordIndex < parsedWords.length; wordIndex++) {
+    const sourceWord = parsedWords[wordIndex];
+    for (const token of sourceWord.tokens) {
+      const cfa = token.cfa;
+      const candidates = Array.from(discoveredHeaders.values())
+        .map(headers => headers.get(cfa))
+        .filter((header): header is NonNullable<typeof header> => header !== undefined);
+      const contextualCandidates = candidates.filter(header => header.module === sourceWord.module);
+      const header = contextualCandidates.length === 1
+        ? contextualCandidates[0]
+        : (contextualCandidates.length === 0 && candidates.length === 1 ? candidates[0] : undefined);
+      const anonymousCandidates = header ? [] : memoryRegions.filter(region =>
+        cfa >= region.start && cfa + 1 < region.end && hasValidUnresolvedColonBody(region, cfa)
+      );
+      const contextualAnonymousCandidates = anonymousCandidates.filter(region => region.module === sourceWord.module);
+      const anonymousRegion = contextualAnonymousCandidates.length === 1
+        ? contextualAnonymousCandidates[0]
+        : (contextualAnonymousCandidates.length === 0 && anonymousCandidates.length === 1 ? anonymousCandidates[0] : undefined);
+      const module = header?.module ?? anonymousRegion?.module;
+      const mem = header?.mem ?? anonymousRegion?.mem;
+      const codep = header?.codep ?? (anonymousRegion ? CODE_CALL : undefined);
+      if (!module || !mem || codep === undefined) continue;
 
-    const key = `${module}:${cfa}`;
-    if (parsedWordKeys.has(key)) continue;
-    parsedWordKeys.add(key);
-    const name = header?.name ?? `W_0x${cfa.toString(16).padStart(4, '0')}`;
-    const pfa = cfa + 2;
-    const body = codep === CODE_CALL ? decompileColon(mem, pfa, module) : undefined;
-    const machineCode = !body ? getMachineCodeBytes(module, codep, pfa, header?.headerAddr) : undefined;
-    parsedWords.push({
-      name,
-      cfa,
-      cfaHex: `0x${cfa.toString(16).padStart(4, '0')}`,
-      pfa,
-      pfaHex: `0x${pfa.toString(16).padStart(4, '0')}`,
-      codep,
-      codepHex: `0x${codep.toString(16).padStart(4, '0')}`,
-      module,
-      type: body ? 'colon' : 'primitive',
-      typeLabel: body
-        ? (header ? 'Recovered colon definition (raw memory)' : 'Unresolved-name colon word (raw memory)')
-        : 'Unresolved word (raw memory)',
-      decompiled: body
-        ? `: ${name}  ${body.decompiled}`
-        : `RAW ${name} [codep: 0x${codep.toString(16).padStart(4, '0')}]`,
-      tokens: body?.tokens ?? [],
-      rawBytes: mem.subarray(cfa, Math.min(cfa + 32, mem.length)),
-      ...(machineCode ? { machineCodeBytes: machineCode.bytes, machineCodeIsInline: machineCode.isInline } : {})
-    });
+      const key = `${module}:${cfa}`;
+      if (parsedWordKeys.has(key)) continue;
+      parsedWordKeys.add(key);
+      const name = header?.name ?? `W_0x${cfa.toString(16).padStart(4, '0')}`;
+      const pfa = cfa + 2;
+      const body = codep === CODE_CALL ? decompileColon(mem, pfa, module) : undefined;
+      const machineCode = !body ? getMachineCodeBytes(module, codep, pfa, header?.headerAddr) : undefined;
+      parsedWords.push({
+        name,
+        cfa,
+        cfaHex: `0x${cfa.toString(16).padStart(4, '0')}`,
+        pfa,
+        pfaHex: `0x${pfa.toString(16).padStart(4, '0')}`,
+        codep,
+        codepHex: `0x${codep.toString(16).padStart(4, '0')}`,
+        module,
+        type: body ? 'colon' : 'primitive',
+        typeLabel: body
+          ? (header ? 'Recovered colon definition (raw memory)' : 'Unresolved-name colon word (raw memory)')
+          : 'Unresolved word (raw memory)',
+        decompiled: body
+          ? `: ${name}  ${body.decompiled}`
+          : `RAW ${name} [codep: 0x${codep.toString(16).padStart(4, '0')}]`,
+        tokens: body?.tokens ?? [],
+        rawBytes: mem.subarray(cfa, Math.min(cfa + 32, mem.length)),
+        ...(machineCode ? { machineCodeBytes: machineCode.bytes, machineCodeIsInline: machineCode.isInline } : {})
+      });
+    }
   }
 
   return new ForthEngine(parsedWords);

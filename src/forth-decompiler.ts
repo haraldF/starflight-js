@@ -7,7 +7,7 @@
  * 3. Reverse-engineered dictionary symbols from the Starflight research database
  */
 
-import { STARA_SIZE, TOTAL_DISK_SIZE } from './starflight-fs';
+import { STARA_SIZE } from './starflight-fs';
 
 export type ForthWordType = 'colon' | 'variable' | 'constant' | 'user' | 'afield' | 'case' | 'primitive';
 
@@ -36,6 +36,8 @@ export interface ForthWord {
   decompiled: string;
   tokens: ForthToken[];
   rawBytes: Uint8Array;
+  machineCodeBytes?: Uint8Array;
+  machineCodeIsInline?: boolean;
 }
 
 // Known Forth Execution Tokens in Starflight's 8086 Forth Engine
@@ -56,7 +58,8 @@ export const CFA_EXIT2 = 0x79c9;       // RET / EXIT alias
 
 export class ForthEngine {
   readonly words: ForthWord[] = [];
-  readonly wordsByCfa = new Map<number, ForthWord>();
+  readonly wordsByCfa = new Map<number, ForthWord[]>();
+  readonly wordsByModuleAndCfa = new Map<string, ForthWord[]>();
   readonly wordsByName = new Map<string, ForthWord[]>();
   readonly modules: string[] = [];
 
@@ -65,7 +68,15 @@ export class ForthEngine {
     const moduleSet = new Set<string>();
 
     for (const w of words) {
-      this.wordsByCfa.set(w.cfa, w);
+      const cfaWords = this.wordsByCfa.get(w.cfa) ?? [];
+      cfaWords.push(w);
+      this.wordsByCfa.set(w.cfa, cfaWords);
+
+      const moduleCfaKey = `${w.module}:${w.cfa}`;
+      const moduleCfaWords = this.wordsByModuleAndCfa.get(moduleCfaKey) ?? [];
+      moduleCfaWords.push(w);
+      this.wordsByModuleAndCfa.set(moduleCfaKey, moduleCfaWords);
+
       if (!this.wordsByName.has(w.name.toUpperCase())) {
         this.wordsByName.set(w.name.toUpperCase(), []);
       }
@@ -80,11 +91,20 @@ export class ForthEngine {
     });
   }
 
-  get(nameOrCfa: string | number): ForthWord | undefined {
+  get(nameOrCfa: string | number, module?: string): ForthWord | undefined {
     if (typeof nameOrCfa === 'number') {
-      return this.wordsByCfa.get(nameOrCfa);
+      const candidates = module
+        ? this.wordsByModuleAndCfa.get(`${module}:${nameOrCfa}`) ?? []
+        : this.wordsByCfa.get(nameOrCfa) ?? [];
+      return candidates.length === 1 ? candidates[0] : undefined;
     }
     const list = this.wordsByName.get(nameOrCfa.trim().toUpperCase());
+    if (module) {
+      const moduleWord = list?.find(word => word.module === module);
+      if (moduleWord) return moduleWord;
+      const kernelWord = list?.find(word => word.module === 'KERNEL');
+      if (kernelWord) return kernelWord;
+    }
     return list?.[0];
   }
 
@@ -125,26 +145,22 @@ export async function createForthEngine(
   const starb = new Uint8Array(starbBuffer);
   const starflt = new Uint8Array(starfltBuffer);
 
-  // Symbol resolution map: CFA (16-bit) -> Name
-  const cfaNameMap = new Map<number, string>();
-
-  // 1. Seed well-known Forth Primitives
-  cfaNameMap.set(CFA_LIT, '(LIT)');
-  cfaNameMap.set(CFA_0BRANCH, '0BRANCH');
-  cfaNameMap.set(CFA_BRANCH, 'BRANCH');
-  cfaNameMap.set(CFA_EXIT1, 'EXIT');
-  cfaNameMap.set(CFA_EXIT2, 'EXIT');
-
-  // 2. Load Reverse-Engineered Research Symbols (from forth-dict.json if available)
-  if (forthDictJson) {
-    for (const d of forthDictJson) {
-      if (!d.name) continue;
-      const cfa = (d.word - 2) & 0xffff;
-      if (!cfaNameMap.has(cfa)) {
-        cfaNameMap.set(cfa, d.name);
-      }
+  const cfaNameMaps = new Map<string, Map<number, string>>();
+  const getCfaNameMap = (module: string) => {
+    let nameMap = cfaNameMaps.get(module);
+    if (!nameMap) {
+      nameMap = new Map<number, string>();
+      cfaNameMaps.set(module, nameMap);
     }
-  }
+    return nameMap;
+  };
+
+  const kernelCfaNameMap = getCfaNameMap('KERNEL');
+  kernelCfaNameMap.set(CFA_LIT, '(LIT)');
+  kernelCfaNameMap.set(CFA_0BRANCH, '0BRANCH');
+  kernelCfaNameMap.set(CFA_BRANCH, 'BRANCH');
+  kernelCfaNameMap.set(CFA_EXIT1, 'EXIT');
+  kernelCfaNameMap.set(CFA_EXIT2, 'EXIT');
 
   // 3. Load Kernel Memory Model (STARFLT.COM loaded at 0x100)
   const kernelMem = new Uint8Array(0x10000);
@@ -158,8 +174,8 @@ export async function createForthEngine(
     moduleName: string,
     minAddr = 0x100,
     maxAddr = 0x10000
-  ): Array<{ name: string; cfa: number; codep: number; pfa: number; linkp: number; module: string }> {
-    const list: Array<{ name: string; cfa: number; codep: number; pfa: number; linkp: number; module: string }> = [];
+  ): Array<{ name: string; cfa: number; codep: number; pfa: number; linkp: number; module: string; headerAddr: number }> {
+    const list: Array<{ name: string; cfa: number; codep: number; pfa: number; linkp: number; module: string; headerAddr: number }> = [];
     let curr = linkpStart;
     const visited = new Set<number>();
 
@@ -183,8 +199,9 @@ export async function createForthEngine(
       const codep = mem[cfa] | (mem[cfa + 1] << 8);
       const pfa = cfa + 2;
 
-      list.push({ name: wordName.trim(), cfa, codep, pfa, linkp, module: moduleName });
-      cfaNameMap.set(cfa, wordName.trim());
+      list.push({ name: wordName.trim(), cfa, codep, pfa, linkp, module: moduleName, headerAddr: curr });
+      const nameMap = getCfaNameMap(moduleName);
+      if (!nameMap.has(cfa)) nameMap.set(cfa, wordName.trim());
 
       if (linkp <= minAddr || linkp === curr) break;
       curr = linkp - 2;
@@ -193,7 +210,7 @@ export async function createForthEngine(
   }
 
   // Parse STARFLT.COM vocabularies
-  const rawKernelWords: Array<{ name: string; cfa: number; codep: number; pfa: number; linkp: number; module: string }> = [];
+  const rawKernelWords: Array<{ name: string; cfa: number; codep: number; pfa: number; linkp: number; module: string; headerAddr?: number }> = [];
   rawKernelWords.push(...parseVocabulary(kernelMem, 0xd40f - 2, true, 'KERNEL', 0x100, 0x100 + starflt.length));
   rawKernelWords.push(...parseVocabulary(kernelMem, 0xd480 - 2, true, 'KERNEL', 0x100, 0x100 + starflt.length));
 
@@ -210,8 +227,8 @@ export async function createForthEngine(
 
     if (fileno > 0 && (name.endsWith('-OV') || ['CAPTAIN', 'DOCTOR', 'ENGINEER', 'NAVIGATR', 'SCIENCE', 'SHIPBUTTONS', 'LISTICONS', 'MUSIC'].includes(name))) {
       const size = end - start + 16;
-      const buf = fileno === 2 
-        ? starb.subarray(start - STARA_SIZE, start - STARA_SIZE + size) 
+      const buf = fileno === 2
+        ? starb.subarray(start - STARA_SIZE, start - STARA_SIZE + size)
         : stara.subarray(start, start + size);
 
       const storeofs = buf[4] | (buf[5] << 8);
@@ -226,8 +243,20 @@ export async function createForthEngine(
     }
   }
 
+  // Dictionary overlay IDs follow the same ordered overlay table.
+  const researchedWords: Array<{ name: string; cfa: number; codep: number; pfa: number; module: string }> = [];
+  for (const d of forthDictJson ?? []) {
+    if (!d.name || /^W[0-9a-f]{4}$/i.test(d.name)) continue;
+    const module = d.ov === -1 ? 'KERNEL' : overlays[d.ov]?.name;
+    if (!module) continue;
+    const cfa = (d.word - 2) & 0xffff;
+    const nameMap = getCfaNameMap(module);
+    nameMap.set(cfa, d.name);
+    researchedWords.push({ name: d.name, cfa, codep: d.code, pfa: d.word, module });
+  }
+
   // Parse all overlay vocabularies into symbol map
-  const rawOverlayWords: Array<{ name: string; cfa: number; codep: number; pfa: number; linkp: number; module: string; mem: Uint8Array }> = [];
+  const rawOverlayWords: Array<{ name: string; cfa: number; codep: number; pfa: number; linkp: number; module: string; mem: Uint8Array; headerAddr?: number }> = [];
   const overlayMemMap = new Map<string, { mem: Uint8Array; storeofs: number; ovlsize: number }>();
 
   for (const ov of overlays) {
@@ -243,10 +272,149 @@ export async function createForthEngine(
     }
   }
 
+  for (const researchedWord of researchedWords) {
+    const words = researchedWord.module === 'KERNEL' ? rawKernelWords : rawOverlayWords;
+    if (words.some(word => word.cfa === researchedWord.cfa && word.module === researchedWord.module)) continue;
+
+    const mem = researchedWord.module === 'KERNEL'
+      ? kernelMem
+      : overlayMemMap.get(researchedWord.module)?.mem;
+    if (!mem) continue;
+
+    const codep = mem[researchedWord.cfa] | (mem[researchedWord.cfa + 1] << 8);
+    if (codep !== researchedWord.codep) continue;
+
+    words.push({
+      ...researchedWord,
+      linkp: 0,
+      ...(researchedWord.module === 'KERNEL' ? {} : { mem })
+    });
+  }
+
+  function getMachineCodeBytes(
+    module: string,
+    codep: number,
+    pfa?: number,
+    headerAddr?: number
+  ): { bytes: Uint8Array; isInline: boolean } | undefined {
+    if (codep <= 0 || codep >= 0x10000) return undefined;
+    const kernelCodeEnd = 0x100 + starflt.length;
+    const mem = codep >= 0x100 && codep < kernelCodeEnd
+      ? kernelMem
+      : (module === 'KERNEL' ? kernelMem : overlayMemMap.get(module)?.mem);
+    if (!mem) return undefined;
+
+    if (pfa === codep && headerAddr !== undefined) {
+      const words = module === 'KERNEL' ? rawKernelWords : rawOverlayWords;
+      const nextHeader = words.reduce<number | undefined>((next, word) => {
+        if (word.headerAddr === undefined || word.headerAddr <= headerAddr) return next;
+        return next === undefined || word.headerAddr < next ? word.headerAddr : next;
+      }, undefined);
+      const moduleEnd = module === 'KERNEL'
+        ? kernelCodeEnd
+        : (overlayMemMap.get(module)?.storeofs ?? 0) + (overlayMemMap.get(module)?.ovlsize ?? mem.length);
+      const inlineEnd = Math.min(nextHeader ?? moduleEnd, moduleEnd, mem.length);
+      if (inlineEnd > codep) {
+        return { bytes: mem.subarray(codep, inlineEnd), isInline: true };
+      }
+    }
+
+    return { bytes: mem.subarray(codep, Math.min(codep + 64, mem.length)), isInline: false };
+  }
+
+  const knownCodePointers = new Set([
+    ...rawKernelWords.map(word => word.codep),
+    ...rawOverlayWords.map(word => word.codep),
+    ...(forthDictJson ?? []).map(word => word.code)
+  ]);
+  const memoryRegions = [
+    { module: 'KERNEL', mem: kernelMem, start: 0x100, end: Math.min(0x100 + starflt.length, 0x10000), decrypt: true },
+    ...Array.from(overlayMemMap, ([module, overlay]) => ({
+      module,
+      mem: overlay.mem,
+      start: overlay.storeofs,
+      end: Math.min(overlay.storeofs + overlay.ovlsize, 0x10000),
+      decrypt: false
+    }))
+  ];
+  const discoveredHeaders = new Map<string, Map<number, { name: string; cfa: number; codep: number; pfa: number; module: string; mem: Uint8Array; headerAddr: number }>>();
+
+  for (const region of memoryRegions) {
+    const headers = new Map<number, { name: string; cfa: number; codep: number; pfa: number; module: string; mem: Uint8Array; headerAddr: number }>();
+    discoveredHeaders.set(region.module, headers);
+
+    for (let header = region.start; header + 6 < region.end; header++) {
+      const nameLength = region.mem[header + 2] & 0x1f;
+      if (nameLength < 1 || nameLength > 31) continue;
+
+      let name = '';
+      let charCount = 0;
+      let validName = true;
+      while (charCount < 32 && header + 3 + charCount < region.end) {
+        const byte = region.mem[header + 3 + charCount];
+        const charCode = region.decrypt && nameLength !== 1 ? (byte ^ 0x7f) & 0x7f : byte & 0x7f;
+        if (charCode < 33 || charCode > 126) {
+          validName = false;
+          break;
+        }
+        name += String.fromCharCode(charCode);
+        charCount++;
+        if (byte & 0x80) break;
+      }
+      if (!validName || charCount !== nameLength || !(region.mem[header + 2 + charCount] & 0x80)) continue;
+
+      const link = region.mem[header] | (region.mem[header + 1] << 8);
+      if (link < region.start || link >= header) continue;
+      const cfa = header + charCount + 3;
+      if (cfa + 1 >= region.end) continue;
+      const codep = region.mem[cfa] | (region.mem[cfa + 1] << 8);
+      if (!knownCodePointers.has(codep)) continue;
+
+      headers.set(cfa, { name, cfa, codep, pfa: cfa + 2, module: region.module, mem: region.mem, headerAddr: header });
+      const nameMap = getCfaNameMap(region.module);
+      if (!nameMap.has(cfa) || /^W[0-9a-f]{4}$/i.test(nameMap.get(cfa)!)) nameMap.set(cfa, name);
+    }
+  }
+
+  function hasValidUnresolvedColonBody(region: typeof memoryRegions[number], cfa: number): boolean {
+    if ((region.mem[cfa] | (region.mem[cfa + 1] << 8)) !== CODE_CALL) return false;
+
+    let p = cfa + 2;
+    for (let instructions = 0; instructions < 128 && p + 1 < region.end; instructions++) {
+      const token = region.mem[p] | (region.mem[p + 1] << 8);
+      p += 2;
+
+      if (token === CFA_EXIT1 || token === CFA_EXIT2) return true;
+      if (token === CFA_LIT || token === CFA_0BRANCH || token === CFA_BRANCH) {
+        p += 2;
+        continue;
+      }
+
+      const name = cfaNameMaps.get(region.module)?.get(token) ?? kernelCfaNameMap.get(token);
+      if (name === '(ABORT")' || name === '(.\")' || name === 'SET_STR_AS_PARAM') {
+        if (p >= region.end) return false;
+        p += 1 + region.mem[p];
+      }
+      if (p >= region.end) return false;
+    }
+
+    return false;
+  }
+
+  const globalCfaNames = new Map<number, Set<string>>();
+  for (const nameMap of cfaNameMaps.values()) {
+    for (const [cfa, name] of nameMap) {
+      if (/^W[0-9a-f]{4}$/i.test(name)) continue;
+      const names = globalCfaNames.get(cfa) ?? new Set<string>();
+      names.add(name);
+      globalCfaNames.set(cfa, names);
+    }
+  }
+
   // 5. Decompile and format all words
   const parsedWords: ForthWord[] = [];
 
-  function decompileColon(mem: Uint8Array, pfa: number, maxBytes = 256): { decompiled: string; tokens: ForthToken[] } {
+  function decompileColon(mem: Uint8Array, pfa: number, module: string, maxBytes = 256): { decompiled: string; tokens: ForthToken[] } {
     const tokens: ForthToken[] = [];
     let p = pfa;
     const bodyWords: string[] = [];
@@ -298,7 +466,29 @@ export async function createForthEngine(
       }
 
       // Named word call
-      const name = cfaNameMap.get(cfa) || `W_${cfaHex}`;
+      const moduleName = cfaNameMaps.get(module)?.get(cfa);
+      const kernelName = kernelCfaNameMap.get(cfa);
+      const knownNames = globalCfaNames.get(cfa);
+      const name = (moduleName && !/^W[0-9a-f]{4}$/i.test(moduleName) ? moduleName : undefined)
+        ?? kernelName
+        ?? (knownNames?.size === 1 ? Array.from(knownNames)[0] : undefined)
+        ?? `W_${cfaHex}`;
+      if (name === '(ABORT")' || name === '(.\")' || name === 'SET_STR_AS_PARAM') {
+        const length = mem[p];
+        const stringStart = p + 1;
+        const stringEnd = Math.min(stringStart + length, mem.length);
+        const inlineString = Array.from(mem.subarray(stringStart, stringEnd), byte => {
+          if (byte === 0x22) return '\\"';
+          if (byte === 0x5c) return '\\\\';
+          if (byte < 0x20 || byte > 0x7e) return `\\x${byte.toString(16).padStart(2, '0')}`;
+          return String.fromCharCode(byte);
+        }).join('');
+        const call = `${name} "${inlineString}"`;
+        tokens.push({ addr, addrHex, cfa, cfaHex, name: call, kind: 'call' });
+        bodyWords.push(call);
+        p = stringEnd;
+        continue;
+      }
       tokens.push({ addr, addrHex, cfa, cfaHex, name, kind: 'call' });
       bodyWords.push(name);
     }
@@ -317,7 +507,7 @@ export async function createForthEngine(
     if (w.codep === CODE_CALL) {
       type = 'colon';
       typeLabel = ': Colon Definition';
-      const res = decompileColon(kernelMem, w.pfa);
+      const res = decompileColon(kernelMem, w.pfa, 'KERNEL');
       decompiled = `: ${w.name}  ${res.decompiled}`;
       tokens = res.tokens;
     } else if (w.codep === CODE_CONSTANT) {
@@ -341,6 +531,7 @@ export async function createForthEngine(
 
     const rawBytes = kernelMem.subarray(w.cfa, Math.min(w.cfa + 32, 0x10000));
 
+    const machineCode = type === 'primitive' ? getMachineCodeBytes('KERNEL', w.codep, w.pfa, w.headerAddr) : undefined;
     parsedWords.push({
       name: w.name,
       cfa: w.cfa,
@@ -354,7 +545,8 @@ export async function createForthEngine(
       typeLabel,
       decompiled,
       tokens,
-      rawBytes
+      rawBytes,
+      ...(machineCode ? { machineCodeBytes: machineCode.bytes, machineCodeIsInline: machineCode.isInline } : {})
     });
   }
 
@@ -368,7 +560,7 @@ export async function createForthEngine(
     if (w.codep === CODE_CALL) {
       type = 'colon';
       typeLabel = ': Colon Definition';
-      const res = decompileColon(w.mem, w.pfa);
+      const res = decompileColon(w.mem, w.pfa, w.module);
       decompiled = `: ${w.name}  ${res.decompiled}`;
       tokens = res.tokens;
     } else if (w.codep === CODE_CONSTANT) {
@@ -395,6 +587,7 @@ export async function createForthEngine(
 
     const rawBytes = w.mem.subarray(w.cfa, Math.min(w.cfa + 32, 0x10000));
 
+    const machineCode = type === 'primitive' ? getMachineCodeBytes(w.module, w.codep, w.pfa, w.headerAddr) : undefined;
     parsedWords.push({
       name: w.name,
       cfa: w.cfa,
@@ -408,7 +601,66 @@ export async function createForthEngine(
       typeLabel,
       decompiled,
       tokens,
-      rawBytes
+      rawBytes,
+      ...(machineCode ? { machineCodeBytes: machineCode.bytes, machineCodeIsInline: machineCode.isInline } : {})
+    });
+  }
+
+  const referencedModulesByCfa = new Map<number, Set<string>>();
+  for (const word of parsedWords) {
+    for (const token of word.tokens) {
+      const modules = referencedModulesByCfa.get(token.cfa) ?? new Set<string>();
+      modules.add(word.module);
+      referencedModulesByCfa.set(token.cfa, modules);
+    }
+  }
+  const parsedWordKeys = new Set(parsedWords.map(word => `${word.module}:${word.cfa}`));
+  for (const [cfa, sourceModules] of referencedModulesByCfa) {
+    const candidates = Array.from(discoveredHeaders.values())
+      .map(headers => headers.get(cfa))
+      .filter((header): header is NonNullable<typeof header> => header !== undefined);
+    const contextualCandidates = candidates.filter(header => sourceModules.has(header.module));
+    const header = contextualCandidates.length === 1
+      ? contextualCandidates[0]
+      : (contextualCandidates.length === 0 && candidates.length === 1 ? candidates[0] : undefined);
+    const anonymousCandidates = header ? [] : memoryRegions.filter(region =>
+      cfa >= region.start && cfa + 1 < region.end && hasValidUnresolvedColonBody(region, cfa)
+    );
+    const contextualAnonymousCandidates = anonymousCandidates.filter(region => sourceModules.has(region.module));
+    const anonymousRegion = contextualAnonymousCandidates.length === 1
+      ? contextualAnonymousCandidates[0]
+      : (contextualAnonymousCandidates.length === 0 && anonymousCandidates.length === 1 ? anonymousCandidates[0] : undefined);
+    const module = header?.module ?? anonymousRegion?.module;
+    const mem = header?.mem ?? anonymousRegion?.mem;
+    const codep = header?.codep ?? (anonymousRegion ? CODE_CALL : undefined);
+    if (!module || !mem || codep === undefined) continue;
+
+    const key = `${module}:${cfa}`;
+    if (parsedWordKeys.has(key)) continue;
+    parsedWordKeys.add(key);
+    const name = header?.name ?? `W_0x${cfa.toString(16).padStart(4, '0')}`;
+    const pfa = cfa + 2;
+    const body = codep === CODE_CALL ? decompileColon(mem, pfa, module) : undefined;
+    const machineCode = !body ? getMachineCodeBytes(module, codep, pfa, header?.headerAddr) : undefined;
+    parsedWords.push({
+      name,
+      cfa,
+      cfaHex: `0x${cfa.toString(16).padStart(4, '0')}`,
+      pfa,
+      pfaHex: `0x${pfa.toString(16).padStart(4, '0')}`,
+      codep,
+      codepHex: `0x${codep.toString(16).padStart(4, '0')}`,
+      module,
+      type: body ? 'colon' : 'primitive',
+      typeLabel: body
+        ? (header ? 'Recovered colon definition (raw memory)' : 'Unresolved-name colon word (raw memory)')
+        : 'Unresolved word (raw memory)',
+      decompiled: body
+        ? `: ${name}  ${body.decompiled}`
+        : `RAW ${name} [codep: 0x${codep.toString(16).padStart(4, '0')}]`,
+      tokens: body?.tokens ?? [],
+      rawBytes: mem.subarray(cfa, Math.min(cfa + 32, mem.length)),
+      ...(machineCode ? { machineCodeBytes: machineCode.bytes, machineCodeIsInline: machineCode.isInline } : {})
     });
   }
 

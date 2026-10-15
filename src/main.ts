@@ -2,12 +2,15 @@ import './style.css';
 import { createStarflightFS, type StarflightFS, type DirEntry } from './starflight-fs';
 import { extractStarSystems, type StarSystemInfo } from './starsystems';
 import { SystemVisualizer } from './system-visualizer';
+import { createForthEngine, type ForthEngine } from './forth-decompiler';
+import { ForthExplorer } from './forth-explorer';
+import { KernelDisassembler } from './kernel-disassembler';
 
 const RECORDS_PER_PAGE = 20;
 const RAW_CHUNK_SIZE = 512;
 
 type FilterMode = 'all' | 'mapped' | 'virtual' | 'pad';
-type ActiveTab = 'explorer' | 'systems';
+type ActiveTab = 'explorer' | 'systems' | 'forth' | 'kernel';
 
 async function loadStar(url: string): Promise<ArrayBuffer> {
   const response = await fetch(url);
@@ -358,8 +361,8 @@ export class ExplorerApp {
             <span style="background: #232a3d; color: #89ddff; font-size: 11px; padding: 2px 6px; border-radius: 4px; margin-left: 4px;">File: ${entry.file}</span>
           </div>
           <div style="font-size: 12px; color: #b2ccd6;">
-            Start: <strong style="color: #82aaff;">0x${entry.startOffset.toString(16).padStart(6, '0')}</strong> | 
-            Size: <strong style="color: #82aaff;">${entry.size.toLocaleString()} bytes</strong> | 
+            Start: <strong style="color: #82aaff;">0x${entry.startOffset.toString(16).padStart(6, '0')}</strong> |
+            Size: <strong style="color: #82aaff;">${entry.size.toLocaleString()} bytes</strong> |
             Records: <strong style="color: #c792ea;">${entry.nblocks}</strong> &times; <strong style="color: #c792ea;">${entry.blockSize}b</strong>
           </div>
         </div>
@@ -391,8 +394,8 @@ export class ExplorerApp {
       }
     });
 
-    const totalPages = hasRecords 
-      ? Math.ceil(totalRecords / RECORDS_PER_PAGE) 
+    const totalPages = hasRecords
+      ? Math.ceil(totalRecords / RECORDS_PER_PAGE)
       : Math.ceil(entry.size / RAW_CHUNK_SIZE);
 
     document.getElementById('btn-next')?.addEventListener('click', () => {
@@ -430,10 +433,14 @@ class MainApp {
   private activeTab: ActiveTab = 'systems'; // Start with the star system visualizer!
   private explorerApp: ExplorerApp;
   private systemVisualizer: SystemVisualizer;
+  private forthExplorer: ForthExplorer;
+  private kernelDisassembler: KernelDisassembler;
 
-  constructor(fs: StarflightFS, systems: StarSystemInfo[]) {
+  constructor(fs: StarflightFS, systems: StarSystemInfo[], forthEngine: ForthEngine, starflt: Uint8Array) {
     this.explorerApp = new ExplorerApp(fs);
     this.systemVisualizer = new SystemVisualizer(systems);
+    this.forthExplorer = new ForthExplorer(forthEngine);
+    this.kernelDisassembler = new KernelDisassembler(starflt);
   }
 
 
@@ -460,6 +467,12 @@ class MainApp {
             <button id="nav-btn-explorer" class="nav-tab ${this.activeTab === 'explorer' ? 'active' : ''}">
               &#9776; File System Explorer
             </button>
+            <button id="nav-btn-forth" class="nav-tab ${this.activeTab === 'forth' ? 'active' : ''}">
+              Forth Explorer
+            </button>
+            <button id="nav-btn-kernel" class="nav-tab ${this.activeTab === 'kernel' ? 'active' : ''}">
+              STARFLT.COM x86
+            </button>
           </nav>
         </header>
 
@@ -477,6 +490,14 @@ class MainApp {
       this.switchTab('explorer');
     });
 
+    document.getElementById('nav-btn-forth')?.addEventListener('click', () => {
+      this.switchTab('forth');
+    });
+
+    document.getElementById('nav-btn-kernel')?.addEventListener('click', () => {
+      this.switchTab('kernel');
+    });
+
     this.renderCurrentTab();
   }
 
@@ -485,11 +506,7 @@ class MainApp {
     this.activeTab = tab;
 
     document.querySelectorAll('.nav-tab').forEach(b => b.classList.remove('active'));
-    if (tab === 'systems') {
-      document.getElementById('nav-btn-systems')?.classList.add('active');
-    } else {
-      document.getElementById('nav-btn-explorer')?.classList.add('active');
-    }
+    document.getElementById(`nav-btn-${tab}`)?.classList.add('active');
 
     this.renderCurrentTab();
   }
@@ -500,24 +517,40 @@ class MainApp {
 
     if (this.activeTab === 'systems') {
       this.systemVisualizer.mount(content);
-    } else {
+    } else if (this.activeTab === 'explorer') {
       this.systemVisualizer.destroy();
       this.explorerApp.mount(content);
+    } else if (this.activeTab === 'forth') {
+      this.systemVisualizer.destroy();
+      this.forthExplorer.mount(content);
+    } else {
+      this.systemVisualizer.destroy();
+      this.kernelDisassembler.mount(content);
     }
   }
 }
 
 async function main() {
   console.log("Loading Starflight game files...");
-  const [stara, starb] = await Promise.all([
+  const [stara, starb, starflt, forthDictResponse] = await Promise.all([
     loadStar('STARA.COM'),
-    loadStar('STARB.COM')
+    loadStar('STARB.COM'),
+    loadStar('STARFLT.COM'),
+    fetch('forth-dict.json')
   ]);
+
+  if (!forthDictResponse.ok) {
+    throw new Error(`Failed to load forth-dict.json: ${forthDictResponse.status} ${forthDictResponse.statusText}`);
+  }
+  const forthDict = await forthDictResponse.json();
 
   console.log("Downloaded STARA.COM:", stara.byteLength, "bytes, STARB.COM:", starb.byteLength, "bytes");
 
   const fs = createStarflightFS(stara, starb);
   console.log(`Mapped all ${fs.entries.length} directory slots from Starflight virtual disk.`);
+
+  const forthEngine = await createForthEngine(stara, starb, starflt, forthDict);
+  console.log(`Loaded ${forthEngine.words.length} Forth words across ${forthEngine.modules.length} modules.`);
 
   console.log("Extracting star systems and planets from STARB.COM instance tree...");
   const systems = extractStarSystems(fs.starb);
@@ -529,7 +562,7 @@ async function main() {
 
   // Mount Application
   if (typeof document !== 'undefined') {
-    const mainApp = new MainApp(fs, systems);
+    const mainApp = new MainApp(fs, systems, forthEngine, new Uint8Array(starflt));
     mainApp.mount();
   }
 }

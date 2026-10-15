@@ -115,7 +115,40 @@ html, body {
   font-weight: bold;
 }
 
+.forth-workspace {
+  grid-template-columns: minmax(320px, 0.8fr) minmax(0, 1.4fr);
+}
 
+.forth-workspace > div {
+  min-width: 0;
+}
+
+.forth-word-list {
+  min-width: 0;
+  max-height: clamp(280px, 55vh, 560px);
+}
+
+.forth-word-info {
+  min-width: 0;
+  flex: 1;
+}
+
+.forth-word-name,
+.forth-word-meta {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.forth-word-type {
+  flex: 0 0 auto;
+}
+
+@media (max-width: 900px) {
+  .forth-workspace {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
 
 .input-num {
   background: #151822;

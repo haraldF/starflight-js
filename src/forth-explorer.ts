@@ -108,6 +108,7 @@ export class ForthExplorer {
               <option value="variable">VARIABLE</option>
               <option value="afield">AFIELD (Instance Records)</option>
               <option value="table">Forth Parameter Tables</option>
+              <option value="sigfield">Signature Fields</option>
               <option value="primitive">CODE (Machine Primitives)</option>
             </select>
 

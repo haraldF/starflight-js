@@ -5,17 +5,19 @@ import {
   CFA_EXIT2,
   CODE_CALL,
   CODE_CONSTANT,
+  CODE_SIGFLD,
   CODE_TABLE,
   CODE_USER,
   CODE_VARIABLE,
   type ForthEngine,
   type ForthToken,
   type ForthWord
-} from './forth-decompiler';
+} from './forth-decompiler.ts';
 
 interface CallFrame {
   word: ForthWord;
   tokenIndex: number;
+  returnStackBase?: number;
 }
 
 interface LoopFrame {
@@ -114,6 +116,12 @@ export class ForthBootRunner {
         }
 
         if (token.kind === 'exit' || token.cfa === CFA_EXIT1 || token.cfa === CFA_EXIT2) {
+          if (frame.returnStackBase !== undefined) {
+            if (returnStack.length <= frame.returnStackBase) {
+              throw new RangeError(`return stack underflow returning from ${frame.word.name}`);
+            }
+            returnStack.pop();
+          }
           trace.push(this.formatTrace(steps, frame.word, token, dataStack, 'return'));
           frames.pop();
           continue;
@@ -151,7 +159,7 @@ export class ForthBootRunner {
         if (!target && frame.word.module === 'KERNEL') {
           const codep = readWord(token.cfa);
           const type = codep === CODE_CONSTANT ? 'constant' : codep === CODE_VARIABLE ? 'variable' : codep === CODE_USER ? 'user' : undefined;
-          if (type) {
+          if (type || codep === 0x3672) {
             const pfa = (token.cfa + 2) & 0xffff;
             target = {
               name: token.name,
@@ -162,9 +170,9 @@ export class ForthBootRunner {
               codep,
               codepHex: `0x${codep.toString(16).padStart(4, '0')}`,
               module: 'KERNEL',
-              type,
-              typeLabel: `${type} inferred from code field`,
-              decompiled: `${type.toUpperCase()} ${token.name}`,
+              type: type ?? 'primitive',
+              typeLabel: type ? `${type} inferred from code field` : 'OFFSET primitive inferred from code field',
+              decompiled: type ? `${type.toUpperCase()} ${token.name}` : `OFFSET ${token.name}`,
               tokens: [],
               rawBytes: this.memory.subarray(token.cfa, Math.min(token.cfa + 32, this.memory.length))
             };
@@ -190,6 +198,39 @@ export class ForthBootRunner {
           const entry = readWord(entryAddress);
           push(dataStack, entry);
           trace.push(this.formatTrace(steps, frame.word, token, dataStack, `${target.name}[${tableIndex}] = 0x${entry.toString(16).padStart(4, '0')}`));
+          continue;
+        }
+
+        if (target.codep === CODE_SIGFLD) {
+          const helperNames = ['@', 'SIGBLK', 'BLOCK_2', '+'];
+          const helperWords = helperNames.map(name => this.engine.get(name, 'KERNEL'));
+          if (helperWords.some(word => !word)) {
+            stopReason = `Cannot execute signature-field helper for ${target.name}: helper word is missing.`;
+            break;
+          }
+
+          const helperTokens: ForthToken[] = helperWords.map((word, index) => ({
+            addr: 0x6ec4 + index * 2,
+            addrHex: `0x${(0x6ec4 + index * 2).toString(16)}`,
+            cfa: word!.cfa,
+            cfaHex: word!.cfaHex,
+            name: word!.name,
+            kind: 'call'
+          }));
+          helperTokens.push({ addr: 0x6ecc, addrHex: '0x6ecc', cfa: CFA_EXIT1, cfaHex: `0x${CFA_EXIT1.toString(16)}`, name: ';', kind: 'exit' });
+          const helper: ForthWord = {
+            ...target,
+            name: `SIGFLD ${target.name}`,
+            type: 'colon',
+            typeLabel: 'CODESIGFLD helper',
+            decompiled: ': SIGFLD  @ SIGBLK BLOCK_2 + ;',
+            tokens: helperTokens
+          };
+          const returnStackBase = returnStack.length;
+          push(dataStack, target.pfa);
+          push(returnStack, this.getReturnAddress(frame, token));
+          frames.push({ word: helper, tokenIndex: 0, returnStackBase });
+          trace.push(this.formatTrace(steps, frame.word, token, dataStack, `SIGFLD descriptor ${target.name}`));
           continue;
         }
 
@@ -273,16 +314,17 @@ export class ForthBootRunner {
           continue;
         }
 
-        if (target.name === 'EXECUTE') {
-          const executionPfa = pop(dataStack, 'data');
+        if (target.name === 'EXECUTE' || target.name === '@EXECUTE') {
+          const executionOperand = pop(dataStack, 'data');
+          const executionPfa = target.name === '@EXECUTE' ? readWord(executionOperand) : executionOperand;
           const executionCfa = (executionPfa - 2) & 0xffff;
           const executionCandidates = this.engine.wordsByCfa.get(executionCfa) ?? [];
           const executionTarget = executionCandidates.find(word => word.module === frame.word.module)
             ?? (executionCandidates.length === 1 ? executionCandidates[0] : undefined);
           if (!executionTarget) {
             const codep = readWord(executionCfa);
-            trace.push(this.formatTrace(steps, frame.word, token, dataStack, `EXECUTE PFA 0x${executionPfa.toString(16)} -> CFA 0x${executionCfa.toString(16)} (code pointer 0x${codep.toString(16)})`));
-            stopReason = `EXECUTE target PFA 0x${executionPfa.toString(16)} resolves to unindexed CFA 0x${executionCfa.toString(16)} (code pointer 0x${codep.toString(16)}).`;
+            trace.push(this.formatTrace(steps, frame.word, token, dataStack, `${target.name} PFA 0x${executionPfa.toString(16)} -> CFA 0x${executionCfa.toString(16)} (code pointer 0x${codep.toString(16)})`));
+            stopReason = `${target.name} target PFA 0x${executionPfa.toString(16)} resolves to unindexed CFA 0x${executionCfa.toString(16)} (code pointer 0x${codep.toString(16)}).`;
             break;
           }
           if (executionTarget.type === 'constant') {
@@ -292,24 +334,28 @@ export class ForthBootRunner {
           } else if (executionTarget.type === 'user') {
             push(dataStack, 0x078c + readWord(executionTarget.pfa));
           } else if (executionTarget.codep === CODE_CALL) {
-            trace.push(this.formatTrace(steps, frame.word, token, dataStack, `EXECUTE ${executionTarget.name}@${executionTarget.module}`));
-            frames.push({ word: executionTarget, tokenIndex: 0 });
+            trace.push(this.formatTrace(steps, frame.word, token, dataStack, `${target.name} ${executionTarget.name}@${executionTarget.module}`));
+            const returnStackBase = returnStack.length;
+            push(returnStack, this.getReturnAddress(frame, token));
+            frames.push({ word: executionTarget, tokenIndex: 0, returnStackBase });
             continue;
           } else {
             const handled = this.executePrimitive(executionTarget, dataStack, returnStack, output, push, pop, readWord, writeWord, readFarWord, writeFarWord);
             output = handled.output;
             if (!handled.supported) {
-              stopReason = `EXECUTE reached native primitive ${executionTarget.name} (code pointer ${executionTarget.codepHex}); no JS handler is implemented.`;
+              stopReason = `${target.name} reached native primitive ${executionTarget.name} (code pointer ${executionTarget.codepHex}); no JS handler is implemented.`;
               break;
             }
           }
-          trace.push(this.formatTrace(steps, frame.word, token, dataStack, `EXECUTE ${executionTarget.name}@${executionTarget.module}`));
+          trace.push(this.formatTrace(steps, frame.word, token, dataStack, `${target.name} ${executionTarget.name}@${executionTarget.module}`));
           continue;
         }
 
         if (target.codep === CODE_CALL) {
           trace.push(this.formatTrace(steps, frame.word, token, dataStack, `call ${target.name}`));
-          frames.push({ word: target, tokenIndex: 0 });
+          const returnStackBase = returnStack.length;
+          push(returnStack, this.getReturnAddress(frame, token));
+          frames.push({ word: target, tokenIndex: 0, returnStackBase });
           continue;
         }
 
@@ -355,6 +401,59 @@ export class ForthBootRunner {
     };
 
     switch (word.codep) {
+      case 0x3048: { // (BUFFER)
+        const block = pop(dataStack, 'data');
+        let segment = readWord(0x2c84); // PREV
+        let hit = readFarWord(segment, 6) === block
+          && this.readFarByte(segment, 3) === 0;
+
+        if (!hit) {
+          segment = readWord(0x2cbe); // USE
+          if (readFarWord(segment, 6) === block && this.readFarByte(segment, 3) === 0) {
+            hit = true;
+            writeWord(0x2cbe, readWord(0x2c84));
+            writeWord(0x2c84, segment);
+          }
+        }
+
+        if (hit) {
+          push(dataStack, segment);
+          writeWord(0x2c6c, readWord(0x2c84)); // LPREV = PREV
+        } else {
+          push(dataStack, block);
+        }
+        push(dataStack, hit ? 1 : 0);
+        return { supported: true, note: hit ? 'buffer cache hit' : 'buffer cache miss', output };
+      }
+      case 0x2ecd: { // LC@
+        const offset = pop(dataStack, 'data');
+        const segment = pop(dataStack, 'data');
+        push(dataStack, this.readFarByte(segment, offset));
+        return { supported: true, note: 'read far byte', output };
+      }
+      case 0x2f51: { // LWSCAN
+        const value = pop(dataStack, 'data');
+        const count = pop(dataStack, 'data');
+        if (count === 0) {
+          pop(dataStack, 'data');
+          pop(dataStack, 'data');
+          push(dataStack, 0);
+          return { supported: true, note: 'empty far-word search', output };
+        }
+
+        let offset = pop(dataStack, 'data');
+        const segment = pop(dataStack, 'data');
+        for (let index = 0; index < count; index++) {
+          if (readFarWord(segment, offset) === value) {
+            push(dataStack, offset);
+            push(dataStack, 1);
+            return { supported: true, note: `far-word found at ${segment.toString(16)}:${offset.toString(16)}`, output };
+          }
+          offset = (offset + 2) & 0xffff;
+        }
+        push(dataStack, 0);
+        return { supported: true, note: 'far-word not found', output };
+      }
       case 0x4873: // ON
         writeWord(pop(dataStack, 'data'), 1);
         return { supported: true, note: 'native ON: set flag to one', output };
@@ -366,6 +465,9 @@ export class ForthBootRunner {
         push(dataStack, (segment - 0x0192) * 16);
         return { supported: true, note: 'convert segment to address relative to CS', output };
       }
+      case 0x3672: // OFFSET
+        push(dataStack, pop(dataStack, 'data') + readWord(0x2c79));
+        return { supported: true, note: 'add DOS disk offset', output };
       case 0x0d10: { // CMOVE_2
         const count = pop(dataStack, 'data');
         const destination = pop(dataStack, 'data');
@@ -422,6 +524,42 @@ export class ForthBootRunner {
         const address = pop(dataStack, 'data');
         const text = Array.from({ length }, (_, index) => String.fromCharCode(this.memory[(address + index) & 0xffff])).join('');
         return { supported: true, note: `write ${length} characters`, output: output + text };
+      }
+      case 'WORD': {
+        const delimiter = pop(dataStack, 'data') & 0xff;
+        const tibWord = this.engine.get('TIB', 'KERNEL');
+        const inputIndexWord = this.engine.get('>IN', 'KERNEL');
+        const dpWord = this.engine.get('DP', 'KERNEL');
+        if (!tibWord || !inputIndexWord || !dpWord) {
+          return { supported: false, note: 'WORD requires TIB, >IN, and DP user variables', output };
+        }
+
+        const tibAddress = readWord(0x078c + readWord(tibWord.pfa));
+        const inputIndexAddress = 0x078c + readWord(inputIndexWord.pfa);
+        let inputIndex = readWord(inputIndexAddress);
+        let cursor = (tibAddress + inputIndex) & 0xffff;
+        while (this.memory[cursor] === delimiter) {
+          cursor = (cursor + 1) & 0xffff;
+          inputIndex++;
+        }
+
+        const start = cursor;
+        while (this.memory[cursor] !== 0 && this.memory[cursor] !== delimiter) {
+          cursor = (cursor + 1) & 0xffff;
+          inputIndex++;
+        }
+        const length = (cursor - start) & 0xffff;
+        if (this.memory[cursor] === delimiter) inputIndex++;
+        if (length > 255) throw new RangeError(`WORD input exceeds 255 bytes (${length})`);
+
+        const here = readWord(0x078c + readWord(dpWord.pfa));
+        this.memory[here] = length;
+        for (let index = 0; index < length; index++) {
+          this.memory[(here + 1 + index) & 0xffff] = this.memory[(start + index) & 0xffff];
+        }
+        writeWord(inputIndexAddress, inputIndex);
+        push(dataStack, here);
+        return { supported: true, note: `parsed ${length}-byte word from TIB`, output };
       }
       case '!': {
         const address = pop(dataStack, 'data');
@@ -518,6 +656,12 @@ export class ForthBootRunner {
       case 'OR':
         binary((left, right) => left | right);
         return { supported: true, note: 'bitwise OR', output };
+      case 'NOT':
+        unary(value => value === 0 ? 1 : 0);
+        return { supported: true, note: 'logical not', output };
+      case 'XOR':
+        binary((left, right) => left ^ right);
+        return { supported: true, note: 'bitwise XOR', output };
       case 'AND':
         binary((left, right) => left & right);
         return { supported: true, note: 'bitwise AND', output };
@@ -541,6 +685,9 @@ export class ForthBootRunner {
       case '0=':
         unary(value => value === 0 ? 1 : 0);
         return { supported: true, note: 'zero test', output };
+      case '0<':
+        unary(value => toSignedCell(value) < 0 ? 1 : 0);
+        return { supported: true, note: 'signed negative test', output };
       case '=':
         binary((left, right) => left === right ? 1 : 0);
         return { supported: true, note: 'equality test', output };
@@ -593,6 +740,30 @@ export class ForthBootRunner {
         if (interrupt === 0x21 && (ax >>> 8) === 0x11) {
           writeWord(0x16b6, 0);
           return { supported: true, note: 'DOS INT 21h/AH=11h FCB find-first: file found', output };
+        }
+        if (interrupt === 0x21 && (ax >>> 8) === 0x0d) {
+          return { supported: true, note: 'DOS INT 21h/AH=0Dh drive reset (no-op in reference emulator)', output };
+        }
+        if (interrupt === 0x21 && (ax >>> 8) === 0x0f) {
+          const fcb = readWord(0x16c0);
+          this.memory[fcb & 0xffff] = 0x03;
+          writeWord(0x16b6, 0);
+          return { supported: true, note: 'DOS INT 21h/AH=0Fh FCB open', output };
+        }
+        if (interrupt === 0x21 && (ax >>> 8) === 0x29) {
+          const source = (((readWord(0x16c4) & 0xffff) << 4) + readWord(0x16c2)) & 0xfffff;
+          const destination = (((readWord(0x16c6) & 0xffff) << 4) + readWord(0x16c0)) & 0xfffff;
+          this.physicalMemory[destination] = 0;
+          for (let index = 0; index < 5; index++) {
+            this.physicalMemory[(destination + 1 + index) & 0xfffff] = this.physicalMemory[(source + index) & 0xfffff];
+          }
+          const fileSize = this.physicalMemory[(source + 4) & 0xfffff] === 0x42 ? 362496 : 256000;
+          for (let index = 0; index < 4; index++) {
+            this.physicalMemory[(destination + 0x10 + index) & 0xfffff] = (fileSize >>> (index * 8)) & 0xff;
+          }
+          writeWord(0x16b6, 0);
+          writeWord(0x16b8, 0);
+          return { supported: true, note: 'DOS INT 21h/AH=29h parsed FCB filename and size', output };
         }
         if (interrupt === 0x21 && (ax >>> 8) === 0x4a) {
           writeWord(0x16b6, 0x01fe);
@@ -652,9 +823,12 @@ export class ForthBootRunner {
       case 'R>':
         push(dataStack, pop(returnStack, 'return'));
         return { supported: true, note: 'move from return stack', output };
-      case 'R@':
-        push(dataStack, returnStack[returnStack.length - 1] ?? 0);
+      case 'R@': {
+        const value = returnStack[returnStack.length - 1];
+        if (value === undefined) throw new RangeError('return stack underflow');
+        push(dataStack, value);
         return { supported: true, note: 'copy return-stack top', output };
+      }
       case 'SP!':
         dataStack.length = 0;
         return { supported: true, note: 'reset data stack to initialized base', output };
@@ -678,6 +852,12 @@ export class ForthBootRunner {
     return `${steps.toString().padStart(3, ' ')} ${word.module}:${word.name} ${token.name}  [${stackText}] ${note}`;
   }
 
+  private getReturnAddress(frame: CallFrame, token: ForthToken): number {
+    const inlineString = token.name.match(/^(.*?) "[\s\S]*"$/);
+    if (inlineString?.[1] === 'SET_STR_AS_PARAM') return (token.addr + 2) & 0xffff;
+    return frame.word.tokens[frame.tokenIndex]?.addr ?? ((token.addr + 2) & 0xffff);
+  }
+
   private findMatchingLoop(tokens: ForthToken[], startIndex: number): number {
     let nestedLoops = 0;
     for (let index = startIndex; index < tokens.length; index++) {
@@ -689,5 +869,10 @@ export class ForthBootRunner {
       }
     }
     return -1;
+  }
+
+  private readFarByte(segment: number, offset: number): number {
+    const address = (((segment & 0xffff) << 4) + (offset & 0xffff)) & 0xfffff;
+    return this.physicalMemory[address];
   }
 }

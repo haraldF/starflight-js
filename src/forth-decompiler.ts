@@ -7,9 +7,9 @@
  * 3. Reverse-engineered dictionary symbols from the Starflight research database
  */
 
-import { STARA_SIZE } from './starflight-fs';
+import { STARA_SIZE } from './starflight-fs.ts';
 
-export type ForthWordType = 'colon' | 'variable' | 'constant' | 'user' | 'afield' | 'case' | 'table' | 'primitive';
+export type ForthWordType = 'colon' | 'variable' | 'constant' | 'user' | 'afield' | 'case' | 'table' | 'sigfield' | 'primitive';
 
 export interface ForthToken {
   addr: number;
@@ -50,6 +50,7 @@ export const CODE_AFIELD = 0x744d;     // Instance field / attribute accessor
 export const CODE_LOADDATA = 0x73ea;   // File record / data loader
 export const CODE_CASE = 0x4a4f;       // CCASE: CASE: jump table
 export const CODE_TABLE = 0x5275;      // OVT / IARRAYS parameter table
+export const CODE_SIGFLD = 0x6ec1;     // Signature record field accessor
 
 export const CFA_LIT = 0x175d;         // (LIT): literal constant follows
 export const CFA_0BRANCH = 0x15fa;     // (0BRANCH): conditional jump (IF / UNTIL)
@@ -247,13 +248,15 @@ export async function createForthEngine(
   // Dictionary overlay IDs follow the same ordered overlay table.
   const researchedWords: Array<{ name: string; cfa: number; codep: number; pfa: number; module: string }> = [];
   for (const d of forthDictJson ?? []) {
-    if (!d.name || /^W[0-9a-f]{4}$/i.test(d.name)) continue;
+    if (!d.name) continue;
+    const isSyntheticName = /^W[0-9a-f]{4}$/i.test(d.name);
+    if (isSyntheticName && d.code !== CODE_CALL) continue;
     const module = d.ov === -1 ? 'KERNEL' : overlays[d.ov]?.name;
     if (!module) continue;
     const cfa = (d.word - 2) & 0xffff;
-    const nameMap = getCfaNameMap(module);
-    nameMap.set(cfa, d.name);
-    researchedWords.push({ name: d.name, cfa, codep: d.code, pfa: d.word, module });
+    const name = isSyntheticName ? `W_0x${cfa.toString(16).padStart(4, '0')}` : d.name;
+    if (!isSyntheticName) getCfaNameMap(module).set(cfa, name);
+    researchedWords.push({ name, cfa, codep: d.code, pfa: d.word, module });
   }
 
   // Parse all overlay vocabularies into symbol map
@@ -530,6 +533,11 @@ export async function createForthEngine(
       type = 'table';
       typeLabel = 'Forth parameter table';
       decompiled = `TABLE ${w.name} (inline data at 0x${w.pfa.toString(16).padStart(4, '0')})`;
+    } else if (w.codep === CODE_SIGFLD) {
+      type = 'sigfield';
+      typeLabel = 'Signature field accessor';
+      const fieldOffset = kernelMem[w.pfa] | (kernelMem[w.pfa + 1] << 8);
+      decompiled = `SIGFLD ${w.name} (field offset 0x${fieldOffset.toString(16).padStart(4, '0')})`;
     } else {
       decompiled = `CODE ${w.name} [codep: 0x${w.codep.toString(16)}]`;
     }
@@ -590,6 +598,11 @@ export async function createForthEngine(
       type = 'table';
       typeLabel = 'Forth parameter table';
       decompiled = `TABLE ${w.name} (inline data at 0x${w.pfa.toString(16).padStart(4, '0')})`;
+    } else if (w.codep === CODE_SIGFLD) {
+      type = 'sigfield';
+      typeLabel = 'Signature field accessor';
+      const fieldOffset = w.mem[w.pfa] | (w.mem[w.pfa + 1] << 8);
+      decompiled = `SIGFLD ${w.name} (field offset 0x${fieldOffset.toString(16).padStart(4, '0')})`;
     } else {
       decompiled = `CODE ${w.name} [codep: 0x${w.codep.toString(16)}]`;
     }

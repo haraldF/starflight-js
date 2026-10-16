@@ -5,6 +5,7 @@ import { SystemVisualizer } from './system-visualizer';
 import { createForthEngine, type ForthEngine } from './forth-decompiler';
 import { ForthExplorer } from './forth-explorer';
 import { KernelDisassembler } from './kernel-disassembler';
+import { SpeakerAudio } from './speaker-audio';
 import {
   CP437,
   ForthBootRunner,
@@ -19,12 +20,22 @@ import {
 // GAME-OV's ?GAME.IN.PROGRESS (:TIMESTAMP @), which START. calls right after the intro screens.
 const INTRO_DONE_CFA = 0xf525;
 
+// Emulated CPUs, in Forth steps per millisecond: about 60-90 cycles per threaded word on an 8088 at 4.77 MHz, and
+// roughly 3x and 8x that throughput on a 286 at 8 MHz and a 386 at 16 MHz.
+const CPU_SPEEDS = [
+  { label: 'PC/XT 4.77 MHz', rate: STEPS_PER_MILLISECOND },
+  { label: 'AT 8 MHz', rate: 170 },
+  { label: '386 16 MHz', rate: 400 }
+];
+const DEFAULT_CPU_SPEED = 170;
+
 interface SavedGame {
   machine: ForthCheckpoint;
   keysTyped: number;
   fastForward: boolean;
   autoEga: boolean;
   skipIntro: boolean;
+  cpuSpeed?: number;
 }
 
 async function gameCheckpoint(saved?: SavedGame): Promise<SavedGame | undefined> {
@@ -483,14 +494,36 @@ class GameScreen {
   // Keys typed into the current run, and the animation frame that plays it in real time.
   private keysTyped = 0;
   private animationFrame = 0;
+  private readonly speaker = new SpeakerAudio();
   // True while "Skip intro" runs the boot unpaced, until the intro-done breakpoint.
   private fastForward = false;
+  // Whether a run exists, and the state its loop last reported; the loop pauses while the Game tab is not shown or
+  // the page is hidden, and resumes from there.
+  private started = false;
+  private loopState: BootState = 'stopped';
+  // The game options, kept while the Game tab is unmounted.
+  private settings = { autoEga: true, skipIntro: true, sound: true, cpuSpeed: DEFAULT_CPU_SPEED };
+  // Aborted on unmount: removes this mount's document listeners.
+  private mounted?: AbortController;
 
   constructor(forthEngine: ForthEngine, starflt: Uint8Array, fs: StarflightFS) {
     this.runner = new ForthBootRunner(forthEngine, starflt, fs);
   }
 
+  // Stop the animation loop and the sound, e.g. when another tab is shown. The run itself is kept.
+  unmount(): void {
+    this.mounted?.abort();
+    this.mounted = undefined;
+    cancelAnimationFrame(this.animationFrame);
+    this.animationFrame = 0;
+    this.speaker.silence();
+  }
+
   mount(target: HTMLElement) {
+    this.unmount();
+    const mounted = new AbortController();
+    this.mounted = mounted;
+    const { signal } = mounted;
     target.innerHTML = `
       <div class="game-view">
         <canvas class="game-canvas" width="320" height="200" role="img" tabindex="0" aria-label="Starflight game screen, 320 by 200 pixels"></canvas>
@@ -499,8 +532,12 @@ class GameScreen {
             <button id="run-forth-boot" class="btn" type="button">Run Forth Boot</button>
             <button id="save-game" class="btn" type="button" disabled>Save</button>
             <button id="load-game" class="btn" type="button">Load</button>
+            <button id="full-screen" class="btn" type="button">Full screen</button>
             <label><input id="auto-ega" type="checkbox" checked> Auto-select EGA</label>
             <label><input id="skip-intro" type="checkbox" checked> Skip intro</label>
+            <label><input id="sound" type="checkbox" checked> Sound</label>
+            <label>CPU <select id="cpu-speed">${CPU_SPEEDS.map(({ label, rate }) =>
+              `<option value="${rate}"${rate === DEFAULT_CPU_SPEED ? ' selected' : ''}>${label}</option>`).join('')}</select></label>
             <span>Entry: W_0x0937 · 16-bit cells · 64K memory · click the screen and type to send keys</span>
           </div>
           <div id="forth-boot-status" role="status">Ready to start from the first Forth CFA.</div>
@@ -519,6 +556,17 @@ class GameScreen {
 
     const autoEga = target.querySelector<HTMLInputElement>('#auto-ega');
     const skipIntro = target.querySelector<HTMLInputElement>('#skip-intro');
+    const cpuSpeed = target.querySelector<HTMLSelectElement>('#cpu-speed');
+    const sound = target.querySelector<HTMLInputElement>('#sound');
+    if (autoEga) autoEga.checked = this.settings.autoEga;
+    if (skipIntro) skipIntro.checked = this.settings.skipIntro;
+    if (sound) sound.checked = this.settings.sound;
+    if (cpuSpeed) cpuSpeed.value = String(this.settings.cpuSpeed);
+    const applyCpuSpeed = () => {
+      this.settings.cpuSpeed = Number(cpuSpeed?.value ?? DEFAULT_CPU_SPEED);
+      this.runner.setStepsPerMillisecond(this.settings.cpuSpeed);
+    };
+    applyCpuSpeed();
     // Answers the display-mode menu with "5. EGA" and Enter before the keys typed on the canvas.
     const egaKeys = [biosKey('5')!, biosKey('Enter')!];
 
@@ -527,13 +575,13 @@ class GameScreen {
     const saveButton = target.querySelector<HTMLButtonElement>('#save-game')!;
     const loadButton = target.querySelector<HTMLButtonElement>('#load-game')!;
     const checkpointStatus = target.querySelector<HTMLElement>('#checkpoint-status')!;
-    let started = false;
+    saveButton.disabled = !this.started;
 
     const show = (state: BootState, updateTrace: boolean) => {
       const result = this.runner.snapshot();
       if (result.graphics) this.renderGraphicsScreen(canvas, result.graphics);
       else this.renderTextScreen(canvas, result.screen);
-      const seconds = (result.steps / STEPS_PER_MILLISECOND / 1000).toFixed(1);
+      const seconds = (this.runner.milliseconds / 1000).toFixed(1);
       const keys = `${autoEga?.checked ? 'EGA auto-selected · ' : ''}${this.keysTyped} key(s) typed`;
       const where = state === 'waiting' ? 'waiting for a key'
         : state === 'stopped' ? result.stopReason
@@ -550,6 +598,7 @@ class GameScreen {
     // waits such as the intro screens last as long as on the PC. A frame's slice is capped at 100 ms.
     const resume = (initialState: BootState) => {
       cancelAnimationFrame(this.animationFrame);
+      this.loopState = initialState;
       let last = performance.now();
       let lastTrace = 0;
       let lastState = initialState;
@@ -566,25 +615,37 @@ class GameScreen {
             this.runner.clearBreakpoints();
           }
         } else {
-          state = this.runner.advance(Math.round(elapsed * STEPS_PER_MILLISECOND));
+          state = this.runner.advance(Math.round(elapsed * this.runner.stepsPerMillisecond));
+        }
+        const events = this.runner.takeSpeakerEvents();
+        if (sound?.checked && !this.fastForward && state !== 'stopped' && !document.hidden) {
+          this.speaker.play(events, this.runner.milliseconds, this.runner.speakerTone);
+        } else {
+          this.speaker.silence();
         }
         const updateTrace = state !== lastState || now - lastTrace > 1000;
         if (updateTrace) lastTrace = now;
         lastState = state;
+        this.loopState = state;
         show(state, updateTrace);
-        if (state !== 'stopped') this.animationFrame = requestAnimationFrame(tick);
+        // A hidden page keeps no loop; visibilitychange resumes it.
+        if (state !== 'stopped' && !document.hidden) this.animationFrame = requestAnimationFrame(tick);
       };
       show(initialState, true);
-      if (initialState !== 'stopped') this.animationFrame = requestAnimationFrame(tick);
+      if (initialState !== 'stopped' && !document.hidden) this.animationFrame = requestAnimationFrame(tick);
       canvas.focus();
     };
     const play = () => {
+      this.speaker.resume();
+      this.speaker.silence();
       this.keysTyped = 0;
       this.fastForward = skipIntro?.checked ?? false;
       this.runner.clearBreakpoints();
       if (this.fastForward) this.runner.setBreakpoint('GAME-OV', INTRO_DONE_CFA);
+      this.settings.autoEga = autoEga?.checked ?? false;
+      this.settings.skipIntro = skipIntro?.checked ?? false;
       this.runner.start(0x0937, autoEga?.checked ? egaKeys : []);
-      started = true;
+      this.started = true;
       saveButton.disabled = false;
       checkpointStatus.textContent = '';
       resume('running');
@@ -597,10 +658,13 @@ class GameScreen {
         if (saving) {
           await gameCheckpoint({
             machine: this.runner.saveState(), keysTyped: this.keysTyped, fastForward: this.fastForward,
-            autoEga: autoEga?.checked ?? false, skipIntro: skipIntro?.checked ?? false
+            autoEga: autoEga?.checked ?? false, skipIntro: skipIntro?.checked ?? false,
+            cpuSpeed: this.runner.stepsPerMillisecond
           });
           checkpointStatus.textContent = 'Checkpoint saved.';
         } else {
+          this.speaker.resume();
+          this.speaker.silence();
           const saved = await gameCheckpoint();
           if (!saved) throw new Error('No saved checkpoint.');
           const state = this.runner.loadState(saved.machine);
@@ -608,14 +672,20 @@ class GameScreen {
           this.fastForward = saved.fastForward;
           if (autoEga) autoEga.checked = saved.autoEga;
           if (skipIntro) skipIntro.checked = saved.skipIntro;
-          started = true;
+          this.settings.autoEga = saved.autoEga;
+          this.settings.skipIntro = saved.skipIntro;
+          if (cpuSpeed && saved.cpuSpeed !== undefined && CPU_SPEEDS.some(({ rate }) => rate === saved.cpuSpeed)) {
+            cpuSpeed.value = String(saved.cpuSpeed);
+          }
+          applyCpuSpeed();
+          this.started = true;
           resume(state);
           checkpointStatus.textContent = 'Checkpoint loaded.';
         }
       } catch (error) {
         checkpointStatus.textContent = error instanceof Error ? error.message : 'Checkpoint storage is unavailable.';
       } finally {
-        saveButton.disabled = !started;
+        saveButton.disabled = !this.started;
         loadButton.disabled = false;
       }
     };
@@ -624,9 +694,49 @@ class GameScreen {
     target.querySelector('#run-forth-boot')?.addEventListener('click', play);
     autoEga?.addEventListener('change', play);
     skipIntro?.addEventListener('change', play);
+    sound?.addEventListener('change', () => {
+      this.settings.sound = sound.checked;
+      if (sound.checked) this.speaker.resume();
+      else this.speaker.silence();
+      canvas.focus();
+    });
+    // A hidden page runs no loop at all; showing it again resumes the run where it was.
+    document.addEventListener('visibilitychange', () => {
+      if (document.hidden) {
+        cancelAnimationFrame(this.animationFrame);
+        this.animationFrame = 0;
+        this.speaker.silence();
+      } else if (this.started && this.animationFrame === 0) {
+        resume(this.loopState);
+      }
+    }, { signal });
+    cpuSpeed?.addEventListener('change', () => {
+      applyCpuSpeed();
+      canvas.focus();
+    });
+
+    // The canvas itself goes full screen; Esc leaves full screen instead of reaching the game.
+    const fullScreenButton = target.querySelector<HTMLButtonElement>('#full-screen')!;
+    fullScreenButton.disabled = !document.fullscreenEnabled;
+    // Browsers may leave full screen on Esc themselves and still deliver the keydown; that Esc is not for the game.
+    let leftFullScreen = -Infinity;
+    document.addEventListener('fullscreenchange', () => {
+      if (!document.fullscreenElement) leftFullScreen = performance.now();
+    }, { signal });
+    fullScreenButton.addEventListener('click', () => {
+      canvas.requestFullscreen().then(() => canvas.focus(), (error: unknown) => {
+        checkpointStatus.textContent = error instanceof Error ? `Full screen is unavailable: ${error.message}` : 'Full screen is unavailable.';
+      });
+    });
 
     canvas.addEventListener('keydown', (event) => {
+      if (event.key === 'Escape' && (document.fullscreenElement === canvas || performance.now() - leftFullScreen < 500)) {
+        event.preventDefault();
+        if (document.fullscreenElement === canvas) void document.exitFullscreen();
+        return;
+      }
       if (event.ctrlKey || event.metaKey || event.altKey) return;
+      if (sound?.checked) this.speaker.resume(); // a key press may unlock audio the page could not start yet
       const key = biosKey(event.key);
       if (key === undefined) return;
       event.preventDefault();
@@ -635,6 +745,9 @@ class GameScreen {
       if (event.repeat && this.runner.pendingKeys > 0) return;
       if (this.runner.pressKey(key)) this.keysTyped++;
     });
+
+    // Back on the Game tab: carry on with the run that was paused when another tab was shown.
+    if (this.started) resume(this.loopState);
   }
 
   // Draw an EGA mode 0Dh picture; the default EGA palette maps its 16 color indices to the RGBI text colors.
@@ -775,6 +888,7 @@ class MainApp {
     const content = document.getElementById('tab-content-area');
     if (!content) return;
 
+    if (this.activeTab !== 'game') this.gameScreen.unmount();
     if (this.activeTab === 'systems') {
       this.systemVisualizer.mount(content);
     } else if (this.activeTab === 'explorer') {

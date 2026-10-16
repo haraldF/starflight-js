@@ -39,6 +39,16 @@ interface BootSession {
   waitedForKey?: boolean;
   // Set when resuming from a breakpoint, so the call it paused before runs instead of breaking again.
   passBreakpoint?: boolean;
+  // Emulated time at a step where the step rate changed; time runs on from there at the new rate.
+  clock?: { step: number; milliseconds: number };
+  // BIOS timer ticks (INT 8, then INT 1Ch) delivered so far, at 1193182 / 65536 Hz of emulated time.
+  timerTicks?: number;
+}
+
+// A change of the PC speaker's output at an emulated time: a square wave at `frequency` Hz, or silence (0).
+export interface SpeakerEvent {
+  milliseconds: number;
+  frequency: number;
 }
 
 interface CallFrame {
@@ -205,11 +215,28 @@ export interface ForthBootOptions {
   ega?: boolean;
   // How many trace lines to keep, most recent last (default 1024); Infinity keeps the whole trace.
   traceLines?: number;
+  // Emulated CPU speed in Forth steps per millisecond of game time (default STEPS_PER_MILLISECOND).
+  stepsPerMillisecond?: number;
+}
+
+// A trace line kept unformatted until it is read: formatting every step's line costs more than running the step.
+interface TraceEntry {
+  steps: number;
+  word: ForthWord;
+  token: ForthToken;
+  stack: number[];
+  note: string;
+}
+
+function formatTraceEntry(entry: string | TraceEntry): string {
+  if (typeof entry === 'string') return entry;
+  const stackText = entry.stack.map(value => `0x${value.toString(16).padStart(4, '0')}`).join(' ');
+  return `${entry.steps.toString().padStart(3, ' ')} ${entry.word.module}:${entry.word.name} ${entry.token.name}  [${stackText}] ${entry.note}`;
 }
 
 // Keeps the last `limit` lines, so multi-million-step runs need neither the memory nor the time of a full trace.
 class TraceBuffer {
-  private readonly lines: string[] = [];
+  private readonly lines: (string | TraceEntry)[] = [];
   private readonly limit: number;
   private next = 0;
   dropped = 0;
@@ -218,7 +245,7 @@ class TraceBuffer {
     this.limit = limit;
   }
 
-  push(line: string): void {
+  push(line: string | TraceEntry): void {
     if (this.lines.length < this.limit) {
       this.lines.push(line);
       return;
@@ -233,7 +260,7 @@ class TraceBuffer {
   }
 
   toArray(): string[] {
-    return [...this.lines.slice(this.next), ...this.lines.slice(0, this.next)];
+    return [...this.lines.slice(this.next), ...this.lines.slice(0, this.next)].map(formatTraceEntry);
   }
 }
 
@@ -245,6 +272,14 @@ export const STEPS_PER_MILLISECOND = 50;
 // The BIOS keyboard buffer at 0040:001Eh holds 16 words, of which 15 can be in use.
 const BIOS_KEY_BUFFER = 15;
 const TIME_COUNTER = 0x188; // TIME's double millisecond counter: high cell at 188h, low cell at 18Ah
+const PIT_HZ = 1193182;
+const TIMER_TICK_MILLISECONDS = 0x10000 * 1000 / PIT_HZ; // the BIOS timer interrupt, about 18.2 Hz
+// The MUSIC overlay's INT 1Ch handler (MUSINT) as HIMUS copies it to MUSSEG:00FFh: PUSH SI/DI/DS/DX/CX/BX/AX, PUSH CS,
+// POP DS.
+const MUSIC_HANDLER_PROLOGUE = [0x56, 0x57, 0x1e, 0x52, 0x51, 0x53, 0x50, 0x0e, 0x1f];
+const MAX_SPEAKER_EVENTS = 4096;
+// The kernel's own INT 1Ch handler at 0192:018Eh: ADD CS:[18Ah], 55 / ADC CS:[188h], 0, TIME's millisecond counter.
+const CLOCK_HANDLER = { segment: 0x0192, offset: 0x018e, prologue: [0x2e, 0x81, 0x06, 0x8a, 0x01] };
 
 export class ForthBootRunner {
   private engine: ForthEngine;
@@ -272,18 +307,27 @@ export class ForthBootRunner {
   private readonly breakpoints = new Set<string>();
   // EGA planes and registers; A000h memory goes through them while a graphics mode is set.
   private ega = new EgaAdapter();
-  // Port 61h: bit 0 gates PIT channel 2, bit 1 drives the PC speaker. No sound is produced.
+  // Port 61h: bit 0 gates PIT channel 2, bit 1 drives the PC speaker; changes are reported as SpeakerEvents.
   private speakerPort = 0;
   // PIT channel 2 divisor; the speaker sounds at 1193182 Hz / divisor while port 61h bits 0 and 1 are set.
   private speakerDivisor = 0;
+  // The low byte of a divisor written to port 42h, until the high byte follows.
+  private pitLowByte?: number;
+  // Speaker changes not yet taken by takeSpeakerEvents(), and the frequency last reported.
+  private speakerEvents: SpeakerEvent[] = [];
+  private speakerFrequency = 0;
+  // The step at which the next timer tick is due; 0 recomputes it on the next step.
+  private nextTimerStep = 0;
   private ports = new Map<number, number>();
   // Steps executed so far in this run; the clock reads it.
   private step = 0;
   private readonly traceLines: number;
+  private rate: number;
 
   constructor(engine: ForthEngine, starflt: Uint8Array, disks: Pick<StarflightFS, 'stara' | 'starb'>, options: ForthBootOptions = {}) {
     this.engine = engine;
     this.traceLines = options.traceLines ?? 1024;
+    this.rate = options.stepsPerMillisecond ?? STEPS_PER_MILLISECOND;
     this.initialDisks = { stara: disks.stara.slice(), starb: disks.starb.slice() };
     this.disks = { stara: this.initialDisks.stara.slice(), starb: this.initialDisks.starb.slice() };
     this.physicalMemory = new Uint8Array(0x100000);
@@ -448,6 +492,10 @@ export class ForthBootRunner {
     this.ega = new EgaAdapter();
     this.speakerPort = 0;
     this.speakerDivisor = 0;
+    this.pitLowByte = undefined;
+    this.speakerEvents = [];
+    this.speakerFrequency = 0;
+    this.nextTimerStep = 0;
     this.ports.clear();
     this.step = 0;
     this.setVideoMode(3);
@@ -480,14 +528,26 @@ export class ForthBootRunner {
   }
 
   private memoryReturnStack(values: number[] = []): number[] {
+    // An array index property ("0", "17"), or -1; a plain digit scan, since this runs on every return-stack access.
+    const arrayIndex = (property: string | symbol): number => {
+      if (typeof property !== 'string' || property.length === 0 || property.length > 9) return -1;
+      if (property.length > 1 && property.charCodeAt(0) === 48) return -1;
+      let index = 0;
+      for (let position = 0; position < property.length; position++) {
+        const digit = property.charCodeAt(position) - 48;
+        if (digit < 0 || digit > 9) return -1;
+        index = index * 10 + digit;
+      }
+      return index;
+    };
     const address = (index: number) => {
       const base = (this.memory[USER_AREA + 2] | (this.memory[USER_AREA + 3] << 8)) || 0xf7d0;
       return (base - (index + 1) * 2) & 0xffff;
     };
     const stack = new Proxy<number[]>([], {
       get: (target, property, receiver) => {
-        if (typeof property === 'string' && /^(0|[1-9][0-9]*)$/.test(property)) {
-          const index = Number(property);
+        const index = arrayIndex(property);
+        if (index >= 0) {
           if (index >= target.length) return undefined;
           const offset = address(index);
           return this.memory[offset] | (this.memory[(offset + 1) & 0xffff] << 8);
@@ -495,8 +555,9 @@ export class ForthBootRunner {
         return Reflect.get(target, property, receiver);
       },
       set: (target, property, value, receiver) => {
-        if (typeof property === 'string' && /^(0|[1-9][0-9]*)$/.test(property)) {
-          const offset = address(Number(property));
+        const index = arrayIndex(property);
+        if (index >= 0) {
+          const offset = address(index);
           this.memory[offset] = value & 0xff;
           this.memory[(offset + 1) & 0xffff] = (value >>> 8) & 0xff;
         }
@@ -510,6 +571,7 @@ export class ForthBootRunner {
   saveState(): ForthCheckpoint {
     const session = this.session;
     if (!session) throw new Error('Start a game before saving a checkpoint.');
+    session.clock = { step: this.step, milliseconds: this.milliseconds }; // so loading at another rate keeps TIME
     const { dataStack, trace, ...execution } = session;
     return structuredClone({
       version: 1,
@@ -558,6 +620,9 @@ export class ForthBootRunner {
     this.ega = ega;
     this.speakerPort = saved.speakerPort;
     this.speakerDivisor = saved.speakerDivisor;
+    this.pitLowByte = undefined;
+    this.speakerEvents = [];
+    this.nextTimerStep = 0;
     this.ports = new Map(saved.ports ?? []);
     this.inferredColons.clear();
     for (const [key, word] of saved.inferredColons) this.inferredColons.set(key, word);
@@ -566,7 +631,43 @@ export class ForthBootRunner {
     const { stackPointer, droppedTraceLines, trace: savedTrace, ...execution } = saved.session;
     this.session = { ...execution, returnStack: this.memoryReturnStack(execution.returnStack), dataStack, trace };
     this.step = execution.steps;
+    // Checkpoints from before the step rate became adjustable ran at the default rate.
+    this.session.clock ??= { step: execution.steps, milliseconds: execution.steps / STEPS_PER_MILLISECOND };
+    this.session.timerTicks ??= Math.floor(this.milliseconds / TIMER_TICK_MILLISECONDS);
+    this.speakerFrequency = -1; // report the restored speaker state
+    this.speakerChanged();
     return execution.state;
+  }
+
+  // Steps per millisecond of emulated time: a faster CPU runs more Forth words in the same game time.
+  get stepsPerMillisecond(): number {
+    return this.rate;
+  }
+
+  // Change the emulated CPU speed; TIME keeps counting from where it is, so timed waits stay continuous.
+  setStepsPerMillisecond(rate: number): void {
+    if (!(rate > 0)) throw new RangeError('The step rate must be positive.');
+    if (this.session) this.session.clock = { step: this.step, milliseconds: this.milliseconds };
+    this.rate = rate;
+    this.nextTimerStep = 0;
+  }
+
+  // Speaker changes since the last call, oldest first, timed in emulated milliseconds (see `milliseconds`).
+  takeSpeakerEvents(): SpeakerEvent[] {
+    const events = this.speakerEvents;
+    this.speakerEvents = [];
+    return events;
+  }
+
+  // The tone the speaker is sounding now, in Hz, or 0 when it is silent.
+  get speakerTone(): number {
+    return this.speakerFrequency;
+  }
+
+  // Emulated milliseconds since start(), as TIME reports them.
+  get milliseconds(): number {
+    const clock = this.session?.clock;
+    return (clock?.milliseconds ?? 0) + (this.step - (clock?.step ?? 0)) / this.rate;
   }
 
   // Type a key into the running machine; a run waiting in (KEY) continues on its next advance().
@@ -659,6 +760,7 @@ export class ForthBootRunner {
         }
         steps++;
         this.step = steps;
+        if (steps >= this.nextTimerStep) this.timerInterrupt();
 
         if (token.kind === 'lit') {
           push(dataStack, Number(token.arg ?? 0));
@@ -1106,13 +1208,52 @@ export class ForthBootRunner {
         const port = pop(dataStack, 'data');
         const value = pop(dataStack, 'data') & 0xff;
         this.ports.set(port, value);
-        if (port === 0x61) this.speakerPort = value;
+        this.writeSpeakerPort(port, value);
         this.ega.out(port, value);
         return { supported: true, note: 'write device port', output };
       }
       case 0x0ed8: // RP@ ( -- address ): read the memory-backed return-stack pointer
         push(dataStack, (readWord(USER_AREA + 2) || 0xf7d0) - returnStack.length * 2);
         return { supported: true, note: 'return stack pointer', output };
+      case 0x21c9: { // headerless ?STACK ( -- ): continue into 0B10h's "Empty stack" / "stack full" ABORT" on a bad SP
+        const limit = toSignedCell(readWord(0x0a0b)) + toSignedCell(readWord(USER_AREA + 4)); // #SPACE + HERE (DP)
+        const pointer = dataStack.pointer;
+        if (limit >= -0x8000 && limit <= 0x7fff && (limit & 0xffff) <= pointer && readWord(USER_AREA) >= pointer) {
+          return { supported: true, note: 'stack within bounds', output };
+        }
+        const target = this.engine.get(0x0b10, 'KERNEL');
+        if (!target) throw new Error('?STACK error word 0x0b10 is missing');
+        const frame = this.session!.frames.at(-1)!;
+        const returnAddress = frame.word.tokens[frame.tokenIndex]?.addr ?? 0;
+        push(returnStack, returnAddress); // JMP [0B10h] runs it in place of NEXT, returning to the current thread
+        this.session!.frames.push({ word: target, tokenIndex: 0, returnAddress });
+        return { supported: true, note: 'stack out of bounds: run W_0x0b10', output };
+      }
+      case 0x367f: { // headerless ( block -- offset index found ): find the drive range holding a block
+        const block = pop(dataStack, 'data');
+        let count = readWord(0x2b3a), found = 0, slot = 0, offset = 0;
+        do { // LOOP from the last range down; a hit sets CX to 1 so the loop ends after it
+          slot = (count - 1) & 0xffff;
+          offset = (block - readWord(0x2d74 + slot * 2)) & 0xffff;
+          if (toSignedCell(offset) >= 0 && toSignedCell((readWord(0x2d4c + slot * 2) - offset) & 0xffff) >= 0) {
+            found++;
+            count = 1;
+          }
+          count = (count - 1) & 0xffff;
+        } while (count !== 0);
+        push(dataStack, offset);
+        push(dataStack, slot);
+        push(dataStack, found);
+        return { supported: true, note: 'find block range', output };
+      }
+      case 0x36bb: { // headerless ( index -- drive ): the range's drive byte at 2D23h, or 2C15h when it is zero, minus one
+        const drive = this.memory[(0x2d23 + pop(dataStack, 'data')) & 0xffff] || readWord(0x2c15);
+        push(dataStack, drive - 1);
+        return { supported: true, note: 'range drive', output };
+      }
+      case 0x8d66: // headerless ( flags -- ): set the BIOS equipment word at 0000:0410h
+        writeFarWord(0, 0x410, pop(dataStack, 'data'));
+        return { supported: true, note: 'set BIOS equipment flags', output };
       case 0x4a0c: // PRTSCR ( -- ): capture BIOS printer output
         return { supported: true, note: 'capture printed screen', output: output + screenLines(this.snapshotScreen()).join('\n') + '\n' };
       case 0xb40e: { // XKEYINT ( -- ): apply the keyboard-hook buffer flush before BIOS processing
@@ -1130,11 +1271,194 @@ export class ForthBootRunner {
         const divisor = signedByte(pop(dataStack, 'data'));
         const multiplier = signedByte(pop(dataStack, 'data'));
         const value = signedByte(pop(dataStack, 'data'));
-        const quotient = Math.trunc(value * multiplier / divisor);
-        if (!Number.isFinite(quotient) || quotient < -128 || quotient > 127) throw new RangeError('C*/ divide overflow (INT 0)');
+        let quotient = Math.trunc(value * multiplier / divisor);
+        if (!Number.isFinite(quotient) || quotient < -128 || quotient > 127) quotient = this.divideFault('C*/ divide overflow (INT 0)');
         push(dataStack, quotient);
         return { supported: true, note: 'signed byte scaling', output };
       }
+      case 0xe770: { // FRACT-OV headerless ARRAY-FILL ( byte -- ): fill the 'ARRAY buffer with a byte
+        if (this.loadedOverlay() !== 'FRACT-OV') break;
+        const value = pop(dataStack, 'data') & 0xff;
+        const array = readWord(0x4cf1);
+        const count = readWord(array + 4), segment = readWord(array + 6);
+        for (let index = 0; index < count; index++) this.writePhysicalByte((segment << 4) + index, value);
+        return { supported: true, note: 'fill array', output };
+      }
+      case 0xe537: { // FRACT-OV headerless ?ARRAY! ( value x y -- ): store a byte in an empty (80h) 'ARRAY cell
+        if (this.loadedOverlay() !== 'FRACT-OV') break;
+        const y = pop(dataStack, 'data'), x = pop(dataStack, 'data');
+        this.fractal(readWord, writeWord, readFarWord).storeIfEmpty(pop(dataStack, 'data'), x, y);
+        return { supported: true, note: 'store in empty array cell', output };
+      }
+      case 0xe75e: { // FRACT-OV headerless PLASMA ( scale 0 0 x0 y0 x1 y1 -- ): subdivide the 'ARRAY rectangle
+        if (this.loadedOverlay() !== 'FRACT-OV') break;
+        const y1 = pop(dataStack, 'data'), x1 = pop(dataStack, 'data');
+        const y0 = pop(dataStack, 'data'), x0 = pop(dataStack, 'data');
+        pop(dataStack, 'data');
+        pop(dataStack, 'data');
+        const scale = pop(dataStack, 'data');
+        writeWord(0xe392, (readWord(USER_AREA + 2) || 0xf7d0) - returnStack.length * 2); // saved BP (return stack)
+        this.fractal(readWord, writeWord, readFarWord).subdivide(scale, x0, y0, x1, y1);
+        return { supported: true, note: 'midpoint-displacement fractal', output };
+      }
+      case 0xead1: // FRACT-OV headerless ( -- ): mark the data stack as the local-cell frame
+        if (this.loadedOverlay() !== 'FRACT-OV') break;
+        writeWord(0xeacd, dataStack.pointer);
+        return { supported: true, note: 'save frame stack pointer', output };
+      case 0xeadc: // FRACT-OV headerless ( x1..x7 -- ): drop seven cells, then mark the frame
+        if (this.loadedOverlay() !== 'FRACT-OV') break;
+        dataStack.pointer = (dataStack.pointer + 14) & 0xffff;
+        writeWord(0xeacd, dataStack.pointer);
+        return { supported: true, note: 'drop frame and save stack pointer', output };
+      case 0xeaea: // FRACT-OV headerless ( offset -- value ): fetch a frame cell
+        if (this.loadedOverlay() !== 'FRACT-OV') break;
+        push(dataStack, readWord(pop(dataStack, 'data') + readWord(0xeacd)));
+        return { supported: true, note: 'fetch frame cell', output };
+      case 0xeaf8: { // FRACT-OV headerless ( value offset -- ): store a frame cell
+        if (this.loadedOverlay() !== 'FRACT-OV') break;
+        const address = pop(dataStack, 'data') + readWord(0xeacd);
+        writeWord(address, pop(dataStack, 'data'));
+        return { supported: true, note: 'store frame cell', output };
+      }
+      case 0xed34: // FRACT-OV headerless ( n -- ): mark the locals base at n's cell and allot n cells below it
+        if (this.loadedOverlay() !== 'FRACT-OV') break;
+        writeWord(0xed30, dataStack.pointer);
+        dataStack.pointer = (dataStack.pointer + 2 - pop(dataStack, 'data') * 2) & 0xffff;
+        return { supported: true, note: 'allot locals', output };
+      case 0xed44: // FRACT-OV headerless ( n -- ): drop n cells
+        if (this.loadedOverlay() !== 'FRACT-OV') break;
+        dataStack.pointer = (dataStack.pointer + 2 + pop(dataStack, 'data') * 2) & 0xffff;
+        return { supported: true, note: 'free locals', output };
+      case 0xed50: // FRACT-OV headerless ( i -- value ): fetch local i below the locals base
+        if (this.loadedOverlay() !== 'FRACT-OV') break;
+        push(dataStack, readWord(readWord(0xed30) - pop(dataStack, 'data') * 2));
+        return { supported: true, note: 'fetch local', output };
+      case 0xed62: { // FRACT-OV headerless ( value i -- ): store local i below the locals base
+        if (this.loadedOverlay() !== 'FRACT-OV') break;
+        const address = readWord(0xed30) - pop(dataStack, 'data') * 2;
+        writeWord(address, pop(dataStack, 'data'));
+        return { supported: true, note: 'store local', output };
+      }
+      case 0xee65: { // FRACT-OV headerless ( offset -- word1 word3 byte0 ): read a 5-byte record from the hidden page
+        if (this.loadedOverlay() !== 'FRACT-OV') break;
+        const segment = readWord(EGA_FLAG) & 1 ? readWord(0x52b3) : readWord(0x55d8);
+        const offset = pop(dataStack, 'data');
+        push(dataStack, readFarWord(segment, offset + 1));
+        push(dataStack, readFarWord(segment, offset + 3));
+        push(dataStack, this.readFarByte(segment, offset));
+        return { supported: true, note: 'read 5-byte record', output };
+      }
+      case 0xee96: { // FRACT-OV headerless ( word1 word3 byte0 -- ): append a 5-byte record at ED7Dh
+        if (this.loadedOverlay() !== 'FRACT-OV') break;
+        const segment = readWord(0x5144), offset = readWord(0xed7d);
+        this.writePhysicalByte((segment << 4) + offset, pop(dataStack, 'data'));
+        writeFarWord(segment, offset + 3, pop(dataStack, 'data'));
+        writeFarWord(segment, offset + 1, pop(dataStack, 'data'));
+        writeWord(0xed7d, offset + 5);
+        return { supported: true, note: 'append 5-byte record', output };
+      }
+      case 0xeec2: // FRACT-OV headerless ( a b c -- ): drop three cells
+        if (this.loadedOverlay() !== 'FRACT-OV') break;
+        dataStack.pointer = (dataStack.pointer + 6) & 0xffff;
+        return { supported: true, note: 'drop three cells', output };
+      case 0xeecc: { // FRACT-OV headerless ( x -- x flag ): x equals ED81h
+        if (this.loadedOverlay() !== 'FRACT-OV') break;
+        const value = pop(dataStack, 'data');
+        push(dataStack, value);
+        push(dataStack, value === readWord(0xed81) ? 1 : 0);
+        return { supported: true, note: 'compare with ED81h', output };
+      }
+      case 0xeee5: // FRACT-OV headerless ( -- 0 404h [ED81h] ): push a terminating record
+        if (this.loadedOverlay() !== 'FRACT-OV') break;
+        push(dataStack, 0);
+        push(dataStack, 0x0404);
+        push(dataStack, readWord(0xed81));
+        return { supported: true, note: 'push terminating record', output };
+      case 0xdd2c: { // ORBIT-OV headerless ( u v -- a b ): interpolate the quad saved by SETQUAD at (u, v) in quarters
+        if (this.loadedOverlay() !== 'ORBIT-OV') break;
+        const v = pop(dataStack, 'data'), u = pop(dataStack, 'data');
+        writeWord(0xdc24, v);
+        writeWord(0xdc28, u);
+        const quad = readWord(0xdc20);
+        const corner = (offset: number) => readWord(quad + offset);
+        const lerp = (selector: number, from: number, to: number): number => {
+          const half = (a: number, b: number) => toSignedCell((a + b + 1) & 0xffff) >> 1 & 0xffff;
+          const middle = half(to, from);
+          switch (readWord(0xdd14 + selector * 2)) { // DD20h: jump table at DD14h
+            case 0xdce4: return from;
+            case 0xdce9: return half(middle, from);
+            case 0xdcf8: return middle;
+            case 0xdd02: return half(middle, to);
+            case 0xdd11: return to;
+            default: throw new Error(`ORBIT-OV DD20h selector ${selector} has no interpolation entry`);
+          }
+        };
+        push(dataStack, lerp(v, lerp(u, corner(0xe), corner(0xa)), lerp(u, corner(2), corner(6))));
+        push(dataStack, lerp(u, lerp(v, corner(0xc), corner(0)), lerp(v, corner(8), corner(4))));
+        return { supported: true, note: 'interpolate quad', output };
+      }
+      case 0xe16b: { // ORBIT-OV headerless ( -- ): translate 3-byte points by the centre at DBD4h/DBD8h/DBDCh
+        if (this.loadedOverlay() !== 'ORBIT-OV') break;
+        const segment = readWord(0x5dd3);
+        let source = readWord(0x569b), destination = readWord(0x5dde);
+        const centre = [this.memory[0xdbd4], this.memory[0xdbd8], this.memory[0xdbdc]];
+        for (let count = readWord(0x5686) || 0x10000; count > 0; count--) {
+          for (const axis of centre) {
+            this.writePhysicalByte((segment << 4) + destination, this.readFarByte(segment, source) - axis);
+            source = (source + 1) & 0xffff;
+            destination = (destination + 1) & 0xffff;
+          }
+        }
+        return { supported: true, note: 'translate points', output };
+      }
+      case 0xe1b6: { // ORBIT-OV headerless ( -- ): rotate 3-byte points by the byte matrix at DCC2h into 6-byte records
+        if (this.loadedOverlay() !== 'ORBIT-OV') break;
+        const segment = readWord(0x5dd3);
+        const signedByte = (value: number) => (value << 24) >> 24;
+        for (let row = 0; row < 3; row++) {
+          const matrix = 0xdcc2 + row * 8;
+          const factors = [this.memory[matrix], this.memory[matrix + 2], this.memory[matrix + 4]].map(signedByte);
+          writeWord(0xdc0c, readWord(matrix + 6));
+          let source = readWord(0x5dde), destination = (readWord(0x56a6) + row * 2) & 0xffff;
+          for (let count = readWord(0x5686) || 0x10000; count > 0; count--) {
+            let sum = readWord(0xdc0c);
+            for (const factor of factors) {
+              sum += signedByte(this.readFarByte(segment, source)) * factor;
+              source = (source + 1) & 0xffff;
+            }
+            writeFarWord(segment, destination, sum);
+            destination = (destination + 6) & 0xffff;
+          }
+        }
+        return { supported: true, note: 'rotate points', output };
+      }
+      case 0xe228: { // ORBIT-OV headerless ( -- ): perspective-project the 6-byte (x y z) records in place
+        if (this.loadedOverlay() !== 'ORBIT-OV') break;
+        const segment = readWord(0x5dd3);
+        const project = (value: number, scale: number, depth: number) => {
+          const quotient = depth === 0 ? NaN : Math.trunc(toSignedCell(value) * toSignedCell(scale) / depth);
+          return quotient >= -0x8000 && quotient <= 0x7fff ? quotient : this.divideFault('ORBIT-OV projection divide overflow (INT 0)');
+        };
+        let record = readWord(0x56a6);
+        for (let count = readWord(0x5686) || 0x10000; count > 0; count--) {
+          const depth = toSignedCell(readFarWord(segment, record + 4));
+          writeFarWord(segment, record + 2, project(readFarWord(segment, record + 2), readWord(0xdc14), depth) + readWord(0x5dec));
+          writeFarWord(segment, record, project(readFarWord(segment, record), readWord(0xdc10), depth) + readWord(0x5dfa));
+          record = (record + 6) & 0xffff;
+        }
+        return { supported: true, note: 'project points', output };
+      }
+      case 0xe48c: // ORBIT-OV headerless ( x1 y1 x2 y2 x3 y3 x4 y4 -- ): store four pairs at DC38h
+        if (this.loadedOverlay() !== 'ORBIT-OV') break;
+        for (let address = 0xdc44; address >= 0xdc38; address -= 4) {
+          writeWord(address, pop(dataStack, 'data'));
+          writeWord(address + 2, pop(dataStack, 'data'));
+        }
+        return { supported: true, note: 'store four pairs', output };
+      case 0xe4aa: // ORBIT-OV headerless ( x1..x8 -- ): drop eight cells
+        if (this.loadedOverlay() !== 'ORBIT-OV') break;
+        dataStack.pointer = (dataStack.pointer + 16) & 0xffff;
+        return { supported: true, note: 'drop eight cells', output };
       case 0xe8f3: // MOVE-OV CBLTP ( x y -- ): configure the cursor bitmap
       case 0xefd9: { // MOVE-OV / MAPS-OV CBLTP ( x y -- ): configure the cursor bitmap
         if ((word.codep === 0xe8f3 && word.module !== 'MOVE-OV') || (word.codep === 0xefd9 && word.module !== 'MAPS-OV')) break;
@@ -1455,8 +1779,8 @@ export class ForthBootRunner {
       case 0x9970: { // WLD>SCR ( x y -- x' y' ): signed coordinate scaling into the viewport
         const scale = (coordinate: number, origin: number, ratio: number, destination: number) => {
           const divisor = toSignedCell(readWord(ratio + 2));
-          const quotient = Math.trunc(toSignedCell((coordinate - readWord(origin)) & 0xffff) * toSignedCell(readWord(ratio)) / divisor);
-          if (!Number.isFinite(quotient) || quotient < -0x8000 || quotient > 0x7fff) throw new RangeError('WLD>SCR divide overflow (INT 0)');
+          let quotient = Math.trunc(toSignedCell((coordinate - readWord(origin)) & 0xffff) * toSignedCell(readWord(ratio)) / divisor);
+          if (!Number.isFinite(quotient) || quotient < -0x8000 || quotient > 0x7fff) quotient = this.divideFault('WLD>SCR divide overflow (INT 0)');
           return (quotient + readWord(destination)) & 0xffff;
         };
         const y = scale(pop(dataStack, 'data'), 0x5b31, 0x6221, 0x596b);
@@ -2260,7 +2584,7 @@ export class ForthBootRunner {
       }
       case 0x2a9a: { // TIME ( -- addr ): bring the millisecond counter up to date and return its address
         // The original reads PIT channel 0 and a budget refilled by the timer interrupt; here time follows the steps.
-        const milliseconds = Math.floor(this.step / STEPS_PER_MILLISECOND);
+        const milliseconds = Math.floor(this.milliseconds);
         writeWord(TIME_COUNTER, Math.floor(milliseconds / 0x10000));
         writeWord(TIME_COUNTER + 2, milliseconds);
         push(dataStack, TIME_COUNTER);
@@ -2268,14 +2592,17 @@ export class ForthBootRunner {
       }
       case 0x2618: { // TONE ( divisor -- ): PIT channel 2, mode 3 square wave (control B6h to port 43h, divisor to 42h)
         this.speakerDivisor = pop(dataStack, 'data');
+        this.speakerChanged();
         const hertz = this.speakerDivisor === 0 ? 1193182 / 0x10000 : 1193182 / this.speakerDivisor;
         return { supported: true, note: `speaker tone ${hertz.toFixed(1)} Hz (divisor ${this.speakerDivisor})`, output };
       }
       case 0x2638: // BEEPON: set the timer gate and speaker bits of port 61h
         this.speakerPort |= 0x03;
-        return { supported: true, note: 'PC speaker on (port 61h bits 0-1 set; no sound is produced)', output };
+        this.speakerChanged();
+        return { supported: true, note: 'PC speaker on (port 61h bits 0-1 set)', output };
       case 0x2653: // BEEPOFF: clear the timer gate and speaker bits of port 61h
         this.speakerPort &= ~0x03;
+        this.speakerChanged();
         return { supported: true, note: 'PC speaker off (port 61h bits 0-1 cleared)', output };
       case 0x7b15: { // VI ( -- n ): the top of the V stack (VSP + 2), left in place
         const pointer = (readWord(0x54b4) + 2) & 0xffff;
@@ -2467,12 +2794,7 @@ export class ForthBootRunner {
         const high = pop(dataStack, 'data');
         const low = pop(dataStack, 'data');
         if (divisor === 0 || high >= divisor) {
-          const handler = readFarWord(0, 0);
-          const segment = readFarWord(0, 2);
-          if (segment !== 0x0192 || ![0x01c4, 0x01c7, 0x01d1].includes(handler)) {
-            throw new RangeError(divisor === 0 ? 'Forth U/MOD division by zero' : 'Forth U/MOD quotient overflow (INT 0)');
-          }
-          push(dataStack, 0);
+          push(dataStack, this.divideFault(divisor === 0 ? 'Forth U/MOD division by zero' : 'Forth U/MOD quotient overflow (INT 0)'));
           push(dataStack, 0);
           return { supported: true, note: 'unsigned divide fault recovered by SET0/: zero remainder and quotient', output };
         }
@@ -2532,7 +2854,11 @@ export class ForthBootRunner {
         const divisor = toSignedCell(pop(dataStack, 'data'));
         const dividend = toSignedCell(pop(dataStack, 'data'));
         const quotient = divisor === 0 ? NaN : Math.trunc(dividend / divisor);
-        if (!(quotient >= -0x8000 && quotient <= 0x7fff)) throw new RangeError('Forth /MOD divide overflow (INT 0)');
+        if (!(quotient >= -0x8000 && quotient <= 0x7fff)) {
+          push(dataStack, this.divideFault('Forth /MOD divide overflow (INT 0)'));
+          push(dataStack, 0);
+          return { supported: true, note: 'signed divide fault recovered: zero remainder and quotient', output };
+        }
         push(dataStack, dividend % divisor);
         push(dataStack, quotient);
         return { supported: true, note: 'signed divide with remainder', output };
@@ -2853,9 +3179,8 @@ export class ForthBootRunner {
     throw new Error(`Unindexed thread continuation 0x${address.toString(16)}`);
   }
 
-  private formatTrace(steps: number, word: ForthWord, token: ForthToken, stack: MemoryStack, note: string): string {
-    const stackText = stack.top(8).map(value => `0x${value.toString(16).padStart(4, '0')}`).join(' ');
-    return `${steps.toString().padStart(3, ' ')} ${word.module}:${word.name} ${token.name}  [${stackText}] ${note}`;
+  private formatTrace(steps: number, word: ForthWord, token: ForthToken, stack: MemoryStack, note: string): TraceEntry {
+    return { steps, word, token, stack: stack.top(8), note };
   }
 
   private getReturnAddress(frame: CallFrame, token: ForthToken): number {
@@ -3465,5 +3790,237 @@ export class ForthBootRunner {
 
   private readFarByte(segment: number, offset: number): number {
     return this.readPhysicalByte(((segment & 0xffff) << 4) + (offset & 0xffff));
+  }
+
+  // Ports 42h/43h program PIT channel 2's divisor (low byte, then high byte); port 61h gates it to the speaker.
+  private writeSpeakerPort(port: number, value: number): void {
+    if (port === 0x43) this.pitLowByte = undefined;
+    else if (port === 0x42) {
+      if (this.pitLowByte === undefined) this.pitLowByte = value & 0xff;
+      else {
+        this.speakerDivisor = this.pitLowByte | ((value & 0xff) << 8);
+        this.pitLowByte = undefined;
+      }
+    } else if (port === 0x61) this.speakerPort = value & 0xff;
+    else return;
+    this.speakerChanged();
+  }
+
+  // Report the speaker's tone when it changes: it sounds while port 61h has both the gate and data bits set.
+  private speakerChanged(): void {
+    const frequency = (this.speakerPort & 3) === 3 ? PIT_HZ / (this.speakerDivisor || 0x10000) : 0;
+    if (frequency === this.speakerFrequency) return;
+    this.speakerFrequency = frequency;
+    if (this.speakerEvents.length >= MAX_SPEAKER_EVENTS) this.speakerEvents.shift(); // nobody is listening
+    this.speakerEvents.push({ milliseconds: this.milliseconds, frequency });
+  }
+
+  // Deliver the BIOS timer ticks that are due by now, then work out the step of the next one. INT 8 itself only
+  // counts; what matters is the INT 1Ch user hook, which the MUSIC overlay points at its player.
+  private timerInterrupt(): void {
+    const session = this.session!;
+    const due = Math.floor(this.milliseconds / TIMER_TICK_MILLISECONDS);
+    session.timerTicks ??= due;
+    while (session.timerTicks < due) {
+      session.timerTicks++;
+      this.userTimerTick();
+    }
+    const clock = session.clock ?? { step: 0, milliseconds: 0 };
+    const nextMilliseconds = (session.timerTicks + 1) * TIMER_TICK_MILLISECONDS;
+    this.nextTimerStep = Math.max(this.step + 1, Math.ceil(clock.step + (nextMilliseconds - clock.milliseconds) * this.rate));
+  }
+
+  // INT 1Ch: nothing for the BIOS's IRET (vector 0000:0000 here) or the kernel clock; the MUSIC player when hooked.
+  private userTimerTick(): void {
+    const offset = this.readPhysicalByte(0x70) | (this.readPhysicalByte(0x71) << 8);
+    const segment = this.readPhysicalByte(0x72) | (this.readPhysicalByte(0x73) << 8);
+    if (offset === 0 && segment === 0) return;
+    const at = (bytes: number[]) => bytes.every((value, index) => this.readFarByte(segment, offset + index) === value);
+    // The kernel clock only advances TIME's counter, which TIME derives from the step count instead.
+    if (segment === CLOCK_HANDLER.segment && offset === CLOCK_HANDLER.offset && at(CLOCK_HANDLER.prologue)) return;
+    if (!at(MUSIC_HANDLER_PROLOGUE)) {
+      throw new Error(`INT 1Ch handler at ${segment.toString(16)}:${offset.toString(16)} has no TypeScript translation`);
+    }
+    this.musicTick(segment);
+  }
+
+  // MUSINT (MUSIC overlay, MUSSEG:00FFh): one timer tick of the song player. Its data sits at the start of MUSSEG:
+  // ?MUSIC (2), the phrase list entry (5: count, then the phrase address), the note pointer (7), REPEATS (9), COUNTER
+  // (10), DURATION (11), RESTVALUE (12), TONESTATE (13) and the divisor table SCALE (24h). A note is a length byte
+  // (bit 40h: leave one tick of silence after it) and a SCALE index, FFh for a rest; a zero length ends the phrase.
+  private musicTick(segment: number): void {
+    const byte = (offset: number) => this.readFarByte(segment, offset);
+    const word = (offset: number) => byte(offset) | (byte(offset + 1) << 8);
+    const setByte = (offset: number, value: number) => this.writePhysicalByte((segment << 4) + (offset & 0xffff), value);
+    const setWord = (offset: number, value: number) => {
+      setByte(offset, value);
+      setByte(offset + 1, value >>> 8);
+    };
+    const silence = (ticks: number) => { // E3F7h with COUNTER and TONESTATE
+      setByte(10, ticks);
+      this.writeSpeakerPort(0x61, this.speakerPort & 0xfc);
+      setByte(13, 1);
+    };
+    if (byte(2) === 0) return;
+    setByte(10, byte(10) - 1);
+    if (byte(10) !== 0) return;
+    if (byte(13) === 0 && byte(12) !== 0) { // the gap after a staccato note
+      silence(byte(12));
+      return;
+    }
+    for (let notes = 0; notes < 0x10000; notes++) {
+      let pointer = word(7);
+      const length = byte(pointer) & 0x7f;
+      if (length !== 0) {
+        setByte(11, length & 0x3f);
+        setByte(12, length & 0x40 ? 1 : 0);
+        const note = byte(pointer + 1);
+        setWord(7, pointer + 2);
+        if (note === 0xff) {
+          silence(byte(11));
+          return;
+        }
+        setByte(10, byte(11) - byte(12));
+        const divisor = word(0x24 + note * 2); // E3E4h: mode 3 on channel 2, then gate it to the speaker
+        this.writeSpeakerPort(0x43, 0xb6);
+        this.writeSpeakerPort(0x42, divisor & 0xff);
+        this.writeSpeakerPort(0x42, divisor >>> 8);
+        this.writeSpeakerPort(0x61, this.speakerPort | 3);
+        setByte(13, 0);
+        return;
+      }
+      pointer = word(5); // the end of a phrase: repeat it, or go on to the next entry
+      setByte(9, byte(9) - 1);
+      if (byte(9) === 0) {
+        pointer = (pointer + 3) & 0xffff;
+        const repeats = byte(pointer);
+        if (repeats === 0) {
+          setWord(2, 0);
+          return;
+        }
+        setWord(5, pointer);
+        setByte(9, repeats);
+      }
+      setWord(7, word(pointer + 1));
+      setByte(10, 1);
+      setByte(13, 1);
+    }
+    throw new Error('MUSIC player found no note in 65,536 empty phrases');
+  }
+
+  // A DIV/IDIV fault (INT 0) reaches the handler SET0/ installs, which clears AX and DX and resumes after the divide
+  // (01C7h; 01C4h on later CPUs, 01D1h while probing): the quotient and remainder read as 0. Without it, stop.
+  private divideFault(message: string): 0 {
+    const vector = (offset: number) => this.readPhysicalByte(offset) | (this.readPhysicalByte(offset + 1) << 8);
+    if (vector(2) !== 0x0192 || ![0x01c4, 0x01c7, 0x01d1].includes(vector(0))) throw new RangeError(message);
+    return 0;
+  }
+
+  // FRACT-OV's near subroutines at E3C0h-E534h, shared by its headerless CODE words. They work on the 'ARRAY
+  // (4CF1h): width at +0, height at +2, a row offset table at segment:[+4] and the cell segment at +6.
+  private fractal(
+    readWord: (address: number) => number,
+    writeWord: (address: number, value: number) => void,
+    readFarWord: (segment: number, offset: number) => number
+  ) {
+    const signed = toSignedCell;
+    // E3C0h ( lo hi -- n ): step the generator at 4AB0h and scale it into lo..hi.
+    const random = (low: number, high: number): number => {
+      const seed = (Math.imul(signed(readWord(0x4ab0)), 0x7abd) + 0x1b0f) & 0xffff;
+      writeWord(0x4ab0, seed);
+      return (Math.floor(seed * ((high - low) & 0xffff) / 0x10000) + low) & 0xffff;
+    };
+    // E4B9h ( x y -- ): wrap x y when 4CCAh is set, then point E378h:E37Ch at the cell.
+    const locate = (x: number, y: number): void => {
+      const array = readWord(0x4cf1);
+      if (signed(readWord(0x4cca)) > 0) { // E469h: reflect y over the poles (shifting x half way round), wrap x
+        const width = readWord(array), height = readWord(array + 2);
+        if (signed(y) < 0) {
+          y = -(y + 1) & 0xffff;
+          x = (x + (width >>> 1)) & 0xffff;
+        } else if (signed((y - height) & 0xffff) >= 0) {
+          y = (2 * height - y + 1) & 0xffff;
+          x = (x + (width >>> 1)) & 0xffff;
+        }
+        if (signed(x) < 0) x = (x + width) & 0xffff;
+        else if (signed((x - width) & 0xffff) >= 0) x = (x - width) & 0xffff;
+      }
+      const segment = readWord(array + 6);
+      writeWord(0xe378, segment);
+      writeWord(0xe37c, readFarWord(segment, readWord(array + 4) + y * 2) + x);
+    };
+    // E4EFh ( -- n ): the located cell, sign-extended when 4CD8h is set.
+    const fetch = (): number => {
+      const value = this.readFarByte(readWord(0xe378), readWord(0xe37c));
+      return signed(readWord(0x4cd8)) > 0 ? ((value << 24) >> 24) & 0xffff : value;
+    };
+    const cell = (x: number, y: number): number => {
+      locate(x, y);
+      return fetch();
+    };
+    // E50Fh ( value x y -- ): store into the cell only if it is still unset (FF80h).
+    const storeIfEmpty = (value: number, x: number, y: number): void => {
+      locate(x, y);
+      if (fetch() === 0xff80) this.writePhysicalByte((readWord(0xe378) << 4) + readWord(0xe37c), value);
+    };
+    // E3FAh + E3E0h ( average x y -- n ): add a random offset within +-scale, reseeded from the position when E356h
+    // is set, and clamp to -127..127.
+    const displace = (average: number, x: number, y: number, scale: number): number => {
+      if (signed(readWord(0xe356)) > 0) {
+        x = (x + readWord(0xe370)) & 0xffff;
+        y = (y + readWord(0xe374)) & 0xffff;
+        if (signed(y) < 0) {
+          y = -(y + 1) & 0xffff;
+          x = (x + 0x480) & 0xffff;
+        } else if (signed((y - 0x3c0) & 0xffff) >= 0) {
+          y = (0x781 - y) & 0xffff;
+          x = (x + 0x480) & 0xffff;
+        }
+        writeWord(0x4ab0, y);
+        const first = random(1, 0xffff);
+        writeWord(0x4ab0, x);
+        writeWord(0x4ab0, random(1, 0xffff) ^ readWord(0x5979) ^ first);
+      }
+      let sum = signed((average + random(-scale & 0xffff, scale)) & 0xffff);
+      if (sum > 0x7f) sum = 0x7f;
+      if (signed((sum + 0x7f) & 0xffff) < 0) sum = -0x7f;
+      return sum & 0xffff;
+    };
+    const half = (value: number) => (signed(value & 0xffff) >> 1) & 0xffff;
+    // E6C2h ( scale 0 0 x0 y0 x1 y1 -- ): fill edge midpoints and the centre, scale the amplitude by E360h/E35Eh,
+    // then recurse into the four quadrants.
+    const subdivide = (scale: number, x0: number, y0: number, x1: number, y1: number): void => {
+      const spanX = signed((x1 - x0 - 1) & 0xffff) > 0 ? 1 : 0;
+      const spanY = signed((y1 - y0 - 1) & 0xffff) > 0 ? 1 : 0;
+      writeWord(0xe36c, spanX);
+      writeWord(0xe368, spanY);
+      if (!(spanX | spanY)) return;
+      const midX = half(x0 + x1), midY = half(y0 + y1); // E691h
+      if (spanY) { // E5B4h: the midpoint of the column x between y0 and y1
+        for (const x of x0 === 0 ? [x0, x1] : [x1]) {
+          writeWord(0xe396, x);
+          storeIfEmpty(displace(half(cell(x, y0) + cell(x, y1)), x, midY, scale), x, midY);
+        }
+      }
+      if (spanX) { // E56Dh: the midpoint of the row y between x0 and x1
+        for (const y of y0 === 0 ? [y0, y1] : [y1]) {
+          writeWord(0xe396, y);
+          storeIfEmpty(displace(half(cell(x0, y) + cell(x1, y)), midX, y, scale), midX, y);
+        }
+      }
+      if (spanX & spanY) { // E630h: the centre from the four edge midpoints
+        const sum = cell(midX, y0) + cell(midX, y1) + cell(x0, midY) + cell(x1, midY);
+        storeIfEmpty(displace((signed(sum & 0xffff) >> 2) & 0xffff, midX, midY, scale), midX, midY);
+      }
+      const product = scale * readWord(0xe360), divisor = readWord(0xe35e); // E6AAh: unsigned MUL / DIV
+      let quotient = divisor === 0 ? NaN : Math.floor(product / divisor);
+      if (!(quotient <= 0xffff)) quotient = this.divideFault('FRACT-OV amplitude divide overflow (INT 0)');
+      const next = signed(quotient) > 0 ? quotient : 1;
+      subdivide(next, x0, y0, midX, midY);
+      subdivide(next, midX, y0, x1, midY);
+      subdivide(next, x0, midY, midX, y1);
+      subdivide(next, midX, midY, x1, y1);
+    };
+    return { storeIfEmpty, subdivide };
   }
 }

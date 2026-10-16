@@ -126,6 +126,17 @@ html, body {
   image-rendering: pixelated;
 }
 
+/* Full screen keeps the 8:5 picture, letterboxed in black. */
+.game-canvas:fullscreen {
+  border: 0;
+  object-fit: contain;
+  outline: none;
+}
+
+.game-canvas::backdrop {
+  background: #000;
+}
+
 .game-view {
   display: flex;
   flex-direction: column;

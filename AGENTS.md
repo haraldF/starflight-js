@@ -119,9 +119,11 @@ npm run inspect -- boot --steps 6000000 --keys '5{Enter}' --key-at '4800000:{Arr
   A live caller uses those directly: `advance(n)` executes up to `n` steps and
   returns `running`, `waiting` (in `(KEY)`, which retries after `pressKey()`),
   or `stopped`. The Game tab plays the boot in real time this way, advancing
-  `STEPS_PER_MILLISECOND` steps per elapsed millisecond each animation frame,
-  so intro pictures stay up as long as on the PC and keys go straight to the
-  running machine (a key also skips the intro waits, as in the game).
+  the runner's `stepsPerMillisecond` steps per elapsed millisecond each
+  animation frame, so intro pictures stay up as long as on the PC and keys go
+  straight to the running machine (a key also skips the intro waits, as in the
+  game). Its CPU selector picks that rate: PC/XT 4.77 MHz (50), AT 8 MHz (170,
+  the default) or 386 16 MHz (400).
 - `setBreakpoint(module, cfa)` makes `advance()` return `break` just before a
   call to that word; the next `advance()` makes the call. `run()` passes
   breakpoints. The Game tab's "Skip intro" option uses one on `GAME-OV`
@@ -140,6 +142,14 @@ npm run inspect -- boot --steps 6000000 --keys '5{Enter}' --key-at '4800000:{Arr
   paths stop the run. In mode 0Dh the result's `graphics` holds the 320x200
   color indices of the page at `A000:0000` (the CRTC start address is not
   modelled), and the Game tab draws it with the default 16-color palette.
+- The BIOS timer interrupt is emulated from game time: every 65536/1193182 s
+  the runner delivers INT 1Ch. The kernel's clock handler (`0192:018E`) is a
+  no-op here (`TIME` already follows the steps); the MUSIC overlay's player,
+  which `HIMUS` copies to `MUSSEG:00FF`, runs as a TypeScript translation. Any
+  other INT 1Ch handler stops the run. `TONE`, `BEEPON`/`BEEPOFF`, `P!` to
+  ports 42h/43h/61h, and the player report speaker changes as timed
+  `SpeakerEvent`s (`takeSpeakerEvents()`), which the Game tab plays as a Web
+  Audio square wave (the Sound checkbox; the intro music needs Skip intro off).
 - `--keys` types ahead for `boot`: each character types itself, and `{Name}`
   types a named key using `KeyboardEvent.key` names (`{Enter}`, `{Escape}`,
   `{ArrowUp}`, `{F1}`, ...). `(KEY)` and `(?TERMINAL)` read this queue as BIOS
@@ -148,7 +158,10 @@ npm run inspect -- boot --steps 6000000 --keys '5{Enter}' --key-at '4800000:{Arr
   a larger `--steps` than the default. The Game tab replays the boot with every
   key typed on the focused canvas since the last Run.
 - Time is emulated deterministically from the step count:
-  `STEPS_PER_MILLISECOND` (50) steps per millisecond. `TIME` returns `0x188`,
+  `STEPS_PER_MILLISECOND` (50) steps per millisecond by default, or the
+  `stepsPerMillisecond` runner option. `setStepsPerMillisecond()` changes the
+  rate mid-run and `TIME` continues from where it was (the session's `clock`
+  keeps the base, so checkpoints load at any rate). `TIME` returns `0x188`,
   a double millisecond counter (high cell at `0x188`, low at `0x18a`). The
   intro's timed waits mean that with `--keys '5{Enter}'` boot needs about 4.7
   million steps, so pass a large `--steps` and pipe through `tail`.

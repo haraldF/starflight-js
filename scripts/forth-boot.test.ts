@@ -655,6 +655,192 @@ test('headerless 0x9a80 fetches the unsigned icon byte without scaling its index
   }
 });
 
+test('FRACT-OV headerless 0xe76e fills the current \'ARRAY buffer with the low byte', async () => {
+  const target = { ...word('W_0xe76e', 0xe76e, 0xe770), module: 'FRACT-OV' };
+  const { runner, result } = await runRealNative([0xbeef, 0x12a5, target], checkpoint => {
+    const memory = new DataView(checkpoint.physicalMemory.buffer);
+    memory.setUint16((0x0192 << 4) + 0x4cf1, 0x6000, true);
+    memory.setUint16((0x0192 << 4) + 0x6004, 5, true);
+    memory.setUint16((0x0192 << 4) + 0x6006, 0x3000, true);
+    checkpoint.physicalMemory.fill(0x11, 0x30000, 0x30008);
+  });
+  assert.equal(result.stopReason, 'Forth returned from the entry word.', result.trace.join('\n'));
+  assert.ok(result.trace.at(-2)!.endsWith('[0xbeef] return'), result.trace.join('\n'));
+  assert.deepEqual([...runner.readMemory(0x3000, 0, 7)], [0xa5, 0xa5, 0xa5, 0xa5, 0xa5, 0x11, 0x11]);
+});
+
+test('FRACT-OV headerless 0xe535 stores only into empty cells, wrapping coordinates over the poles', async () => {
+  const target = { ...word('W_0xe535', 0xe535, 0xe537), module: 'FRACT-OV' };
+  // An 8x4 'ARRAY at 3000:0000 with its row table at 3000:0040; cells hold 80h except offset 3.
+  const cases = [
+    { x: 0xffff, y: 1, wrap: 1, signed: 1, offset: 15 }, // x wraps around to the last column
+    { x: 2, y: 0xffff, wrap: 1, signed: 1, offset: 6 }, // y reflects at the top pole, x shifts by half the width
+    { x: 5, y: 6, wrap: 1, signed: 1, offset: 24 + 1 }, // y reflects at the bottom pole (2h - y + 1), x wraps after the shift
+    { x: 3, y: 0, wrap: 0, signed: 1, offset: 3, unchanged: 0x11 }, // occupied cell
+    { x: 4, y: 2, wrap: 0, signed: 0, offset: 20, unchanged: 0x80 } // unsigned mode never matches FF80h
+  ];
+  for (const { x, y, wrap, signed, offset, unchanged } of cases) {
+    const { runner, result } = await runRealNative([0xbeef, 0x55, x, y, target], checkpoint => {
+      const memory = new DataView(checkpoint.physicalMemory.buffer);
+      for (const [address, value] of [[0x4cf1, 0x6000], [0x6000, 8], [0x6002, 4], [0x6004, 0x40], [0x6006, 0x3000], [0x4cca, wrap], [0x4cd8, signed]]) {
+        memory.setUint16((0x0192 << 4) + address, value, true);
+      }
+      checkpoint.physicalMemory.fill(0x80, 0x30000, 0x30020);
+      checkpoint.physicalMemory[0x30003] = 0x11;
+      for (let row = 0; row < 4; row++) memory.setUint16(0x30040 + row * 2, row * 8, true);
+    });
+    assert.equal(result.stopReason, 'Forth returned from the entry word.', result.trace.join('\n'));
+    assert.ok(result.trace.at(-2)!.endsWith('[0xbeef] return'), result.trace.join('\n'));
+    const cells = [...runner.readMemory(0x3000, 0, 0x20)];
+    assert.equal(cells[offset], unchanged ?? 0x55, `${x},${y}`);
+    assert.equal(cells.filter(cell => cell === 0x55).length, unchanged === undefined ? 1 : 0);
+    const memory = new DataView(runner.saveState().physicalMemory.buffer);
+    assert.deepEqual([memory.getUint16((0x0192 << 4) + 0xe378, true), memory.getUint16((0x0192 << 4) + 0xe37c, true)], [0x3000, offset]);
+  }
+});
+
+const overlayCode = (module: string, cfa: number): ForthWord => ({ ...word(`W_0x${cfa.toString(16)}`, cfa, cfa + 2), module });
+const finalStack = (result: { trace: string[] }) => result.trace.at(-2)!.match(/\[([^\]]*)\] return$/)![1];
+const setWords = (checkpoint: ReturnType<ForthBootRunner['saveState']>, cells: [number, number][]) => {
+  const memory = new DataView(checkpoint.physicalMemory.buffer);
+  for (const [address, value] of cells) memory.setUint16((0x0192 << 4) + address, value, true);
+};
+const readWords = (runner: ForthBootRunner, address: number, count: number) => {
+  const memory = new DataView(runner.saveState().physicalMemory.buffer);
+  return Array.from({ length: count }, (_, index) => memory.getUint16((0x0192 << 4) + address + index * 2, true));
+};
+
+test('FRACT-OV headerless frame, local and record words address the data stack and 5-byte records', async () => {
+  const fract = (cfa: number) => overlayCode('FRACT-OV', cfa);
+  const frame = await runRealNative([0xbeef, 10, 20, 30, fract(0xeacf), 2, fract(0xeae8), 99, 4, fract(0xeaf6)]);
+  assert.equal(frame.result.stopReason, 'Forth returned from the entry word.', frame.result.trace.join('\n'));
+  assert.equal(finalStack(frame.result), '0xbeef 0x0063 0x0014 0x001e 0x0014');
+  const dropped = await runRealNative([0xbeef, 1, 2, 3, 4, 5, 6, 7, fract(0xeada), 0, fract(0xeae8)]);
+  assert.equal(finalStack(dropped.result), '0xbeef 0xbeef');
+
+  const locals = [0xbeef, 3, fract(0xed32), 7, 1, fract(0xed60), 9, 0, fract(0xed60), 5, 2, fract(0xed60), 1, fract(0xed4e), 0, fract(0xed4e)];
+  const fetched = await runRealNative(locals);
+  assert.equal(fetched.result.stopReason, 'Forth returned from the entry word.', fetched.result.trace.join('\n'));
+  assert.equal(finalStack(fetched.result), '0xbeef 0x0009 0x0007 0x0005 0x0007 0x0009');
+  const freed = await runRealNative([...locals, fract(0xeec0), 2, fract(0xed42)]);
+  assert.equal(finalStack(freed.result), '0xbeef');
+
+  const compared = await runRealNative([0xbeef, 0x1234, fract(0xeeca), 5, fract(0xeeca), fract(0xeee3)], checkpoint => setWords(checkpoint, [[0xed81, 0x1234]]));
+  assert.equal(finalStack(compared.result), '0xbeef 0x1234 0x0001 0x0005 0x0000 0x0000 0x0404 0x1234');
+
+  for (const ega of [1, 0]) {
+    const record = await runRealNative([0xbeef, 0x10, fract(0xee63), fract(0xee94)], checkpoint => {
+      setWords(checkpoint, [[0x5da3, ega], [0x52b3, 0x3000], [0x55d8, 0x3100], [0x5144, 0x4000], [0xed7d, 0x20]]);
+      checkpoint.physicalMemory.set([0xaa, 0x34, 0x12, 0x78, 0x56], (ega ? 0x30000 : 0x31000) + 0x10);
+    });
+    assert.equal(record.result.stopReason, 'Forth returned from the entry word.', record.result.trace.join('\n'));
+    assert.ok(record.result.trace.some(line => line.includes('[0xbeef 0x1234 0x5678 0x00aa]')), record.result.trace.join('\n'));
+    assert.equal(finalStack(record.result), '0xbeef');
+    assert.deepEqual([...record.runner.readMemory(0x4000, 0x20, 5)], [0xaa, 0x34, 0x12, 0x78, 0x56]);
+    assert.deepEqual(readWords(record.runner, 0xed7d, 1), [0x25]);
+  }
+});
+
+test('FRACT-OV headerless 0xe75c fills edge midpoints and the centre with displaced averages', async () => {
+  // A 3x3 signed 'ARRAY at 3000:0000 (rows at 0, 3, 6) with its corners set and the rest unset (80h).
+  const corners: Record<number, number> = { 0: 10, 2: 20, 6: 0xf6, 8: 30 };
+  const { runner, result } = await runRealNative([0xbeef, 8, 0, 0, 0, 0, 2, 2, overlayCode('FRACT-OV', 0xe75c)], checkpoint => {
+    setWords(checkpoint, [[0x4cf1, 0x6000], [0x6000, 3], [0x6002, 3], [0x6004, 0x40], [0x6006, 0x3000], [0x4cca, 0], [0x4cd8, 1],
+      [0xe356, 0], [0x4ab0, 0x1234], [0xe360, 1], [0xe35e, 2]]);
+    checkpoint.physicalMemory.fill(0x80, 0x30000, 0x30009);
+    for (const [offset, value] of Object.entries(corners)) checkpoint.physicalMemory[0x30000 + Number(offset)] = value;
+    checkpoint.physicalMemory.set([0, 0, 3, 0, 6, 0], 0x30040);
+  });
+  assert.equal(result.stopReason, 'Forth returned from the entry word.', result.trace.join('\n'));
+  assert.equal(finalStack(result), '0xbeef');
+
+  let seed = 0x1234;
+  const signed = (value: number) => (value << 16) >> 16;
+  const displace = (average: number) => {
+    seed = (Math.imul(signed(seed), 0x7abd) + 0x1b0f) & 0xffff;
+    const offset = signed((Math.floor(seed * 16 / 0x10000) - 8) & 0xffff);
+    return Math.max(-127, Math.min(127, average + offset));
+  };
+  const left = displace(0), right = displace(25), top = displace(15), bottom = displace(10); // (0+-10)/2, (20+30)/2, ...
+  const centre = displace((top + bottom + left + right) >> 2);
+  const cells = [...runner.readMemory(0x3000, 0, 9)].map(value => (value << 24) >> 24);
+  assert.deepEqual(cells, [10, top, 20, left, centre, right, -10, bottom, 30]);
+  assert.equal(readWords(runner, 0x4ab0, 1)[0], seed);
+});
+
+test('ORBIT-OV headerless point routines interpolate, translate, rotate, project and store pairs', async () => {
+  const orbit = (cfa: number) => overlayCode('ORBIT-OV', cfa);
+  const quad: [number, number][] = [0, 40, 80, 120, 160, 200, 240, 280].map((value, index) => [0x6100 + index * 2, value]);
+  for (const [u, v, expected] of [[3, 0, '0x00dc 0x00b4'], [2, 1, '0x00c8 0x00a0']] as const) {
+    const interpolated = await runRealNative([0xbeef, u, v, orbit(0xdd2a)], checkpoint => setWords(checkpoint, [[0xdc20, 0x6100], ...quad]));
+    assert.equal(interpolated.result.stopReason, 'Forth returned from the entry word.', interpolated.result.trace.join('\n'));
+    assert.equal(finalStack(interpolated.result), `0xbeef ${expected}`);
+  }
+
+  const points = await runRealNative([0xbeef, orbit(0xe169), orbit(0xe1b4)], checkpoint => {
+    setWords(checkpoint, [[0x5dd3, 0x3000], [0x569b, 0x10], [0x5dde, 0x40], [0x5686, 2], [0x56a6, 0x80]]);
+    const base = 0x0192 << 4;
+    checkpoint.physicalMemory.set([1], base + 0xdbd4);
+    checkpoint.physicalMemory.set([2], base + 0xdbd8);
+    checkpoint.physicalMemory.set([3], base + 0xdbdc);
+    checkpoint.physicalMemory.set([2, 4, 2, 0x81, 2, 4], 0x30010); // translated to (1, 2, -1) and (-128, 0, 1)
+    checkpoint.physicalMemory.set([2, 0, 0, 0, 0, 0, 100, 0, 0, 0, 1, 0, 0xff, 0, 0, 0, 1, 0, 1, 0, 1, 0, 0xf0, 0xff], base + 0xdcc2);
+  });
+  assert.equal(points.result.stopReason, 'Forth returned from the entry word.', points.result.trace.join('\n'));
+  assert.deepEqual([...points.runner.readMemory(0x3000, 0x40, 6)], [1, 2, 0xff, 0x80, 0, 1]);
+  const records = new DataView(Uint8Array.from(points.runner.readMemory(0x3000, 0x80, 12)).buffer);
+  assert.deepEqual(Array.from({ length: 6 }, (_, index) => records.getInt16(index * 2, true)), [102, 3, -14, -156, -1, -143]);
+
+  const project = (depth: number, handler = true) => runRealNative([0xbeef, orbit(0xe226)], checkpoint => {
+    setWords(checkpoint, [[0x5dd3, 0x3000], [0x56a6, 0x80], [0x5686, 2], [0xdc10, 3], [0xdc14, 4], [0x5dfa, 160], [0x5dec, 100]]);
+    checkpoint.physicalMemory.set(handler ? [0xc7, 0x01, 0x92, 0x01] : [0, 0, 0, 0], 0); // INT 0 -> 0192:01C7 (SET0/)
+    const memory = new DataView(checkpoint.physicalMemory.buffer);
+    for (const [index, value] of [100, -50, depth, 7, 3, -2].entries()) memory.setInt16(0x30080 + index * 2, value, true);
+  });
+  const projected = await project(10);
+  assert.equal(projected.result.stopReason, 'Forth returned from the entry word.', projected.result.trace.join('\n'));
+  const projectedRecords = new DataView(Uint8Array.from(projected.runner.readMemory(0x3000, 0x80, 12)).buffer);
+  assert.deepEqual(Array.from({ length: 6 }, (_, index) => projectedRecords.getInt16(index * 2, true)), [190, 80, 10, 150, 94, -2]);
+  // A zero depth faults; SET0/'s handler zeroes AX and the projection continues with just the screen offset.
+  const flat = await project(0);
+  assert.equal(flat.result.stopReason, 'Forth returned from the entry word.', flat.result.trace.join('\n'));
+  const flatRecords = new DataView(Uint8Array.from(flat.runner.readMemory(0x3000, 0x80, 12)).buffer);
+  assert.deepEqual(Array.from({ length: 6 }, (_, index) => flatRecords.getInt16(index * 2, true)), [160, 100, 0, 150, 94, -2]);
+  assert.match((await project(0, false)).result.stopReason, /projection divide overflow \(INT 0\)/);
+
+  const pairs = await runRealNative([0xbeef, 1, 2, 3, 4, 5, 6, 7, 8, orbit(0xe48a), 1, 2, 3, 4, 5, 6, 7, 8, orbit(0xe4a8)]);
+  assert.equal(pairs.result.stopReason, 'Forth returned from the entry word.', pairs.result.trace.join('\n'));
+  assert.equal(finalStack(pairs.result), '0xbeef');
+  assert.deepEqual(readWords(pairs.runner, 0xdc38, 8), [2, 1, 4, 3, 6, 5, 8, 7]);
+});
+
+test('kernel headerless block-range, drive, equipment and ?STACK words follow the native code', async () => {
+  const kernel = (cfa: number) => word(`W_0x${cfa.toString(16)}`, cfa, cfa + 2);
+  const ranges: [number, number][] = [[0x2b3a, 3], [0x2d74, 0], [0x2d76, 100], [0x2d78, 200], [0x2d4c, 99], [0x2d4e, 99], [0x2d50, 50], [0x2c15, 5]];
+  const lookup = await runRealNative([150, kernel(0x367d), 300, kernel(0x367d), 2, kernel(0x36b9), 1, kernel(0x36b9)], checkpoint => {
+    setWords(checkpoint, ranges);
+    checkpoint.physicalMemory.set([0, 3], (0x0192 << 4) + 0x2d24);
+  });
+  assert.equal(lookup.result.stopReason, 'Forth returned from the entry word.', lookup.result.trace.join('\n'));
+  // 150 lies 50 into range 1; 300 is in no range, leaving range 0's offset; drive bytes 3 and 0 (-> 2C15h) less one.
+  assert.equal(finalStack(lookup.result), '0x0032 0x0001 0x0001 0x012c 0x0000 0x0000 0x0002 0x0004');
+
+  const equipment = await runRealNative([0xbeef, 113, kernel(0x8d64)]);
+  assert.equal(finalStack(equipment.result), '0xbeef');
+  assert.deepEqual([...equipment.runner.readMemory(0, 0x410, 2)], [113, 0]);
+
+  const fine = await runRealNative([0xbeef, kernel(0x21c7)]);
+  assert.equal(fine.result.stopReason, 'Forth returned from the entry word.', fine.result.trace.join('\n'));
+  assert.equal(finalStack(fine.result), '0xbeef');
+  const full = await runRealNative([0xbeef, kernel(0x21c7)], checkpoint => { // #SPACE + HERE reaches FF00h, above SP
+    const here = new DataView(checkpoint.physicalMemory.buffer).getUint16((0x0192 << 4) + 0x0790, true);
+    setWords(checkpoint, [[0x0a0b, (0xff00 - here) & 0xffff]]);
+  });
+  assert.ok(full.result.trace.some(line => line.includes('stack out of bounds: run W_0x0b10')), full.result.trace.join('\n'));
+  assert.ok(full.result.trace.some(line => line.includes('W_0x0ad7')), full.result.trace.join('\n'));
+  assert.match(full.result.output, /Dictionary or stack full/);
+});
+
 test('!IW stores a little-endian word at twice the icon index with 16-bit wrapping', () => {
   const cases = [
     { segment: 0x3000, index: 8, value: 0xabcd },
@@ -1771,6 +1957,88 @@ test('TIME derives a double millisecond counter from the step count', () => {
   assert.equal(result.stopReason, 'Forth returned from the entry word.');
   assert.match(result.trace.at(-4)!, /TIME  \[.*0x0188\] time 4 ms$/);
   assert.match(result.trace.at(-2)!, /0x0004 0x0000\] return$/); // low, high
+});
+
+test('changing the step rate keeps TIME continuous, through checkpoints at other rates', () => {
+  const tokens: ForthToken[] = Array.from({ length: 2000 }, (_, index) => ({
+    addr: 0x1000 + index * 4, addrHex: `0x${(0x1000 + index * 4).toString(16)}`, cfa: 0, cfaHex: '0x0000', name: '1', kind: 'lit', arg: 1
+  }));
+  const engine = new ForthEngine([word('TEST', 0x0937, CODE_CALL, tokens)]);
+  const disks = { stara: new Uint8Array(), starb: new Uint8Array() };
+  const runner = new ForthBootRunner(engine, new Uint8Array(0x200), disks);
+  runner.start(0x0937);
+  runner.advance(100);
+  assert.equal(runner.milliseconds, 100 / STEPS_PER_MILLISECOND);
+  runner.setStepsPerMillisecond(200);
+  runner.advance(400);
+  const expected = 100 / STEPS_PER_MILLISECOND + 2;
+  assert.equal(runner.milliseconds, expected);
+
+  const checkpoint = runner.saveState();
+  const other = new ForthBootRunner(engine, new Uint8Array(0x200), disks, { stepsPerMillisecond: 400 });
+  other.loadState(checkpoint);
+  assert.equal(other.milliseconds, expected);
+  other.advance(400);
+  assert.equal(other.milliseconds, expected + 1);
+
+  const { clock, ...legacy } = checkpoint.session; // saved before the rate was adjustable: the default rate
+  other.loadState({ ...checkpoint, session: legacy });
+  assert.ok(clock);
+  assert.equal(other.milliseconds, 500 / STEPS_PER_MILLISECOND);
+});
+
+// A runner idling in `BEGIN AGAIN` after `prefix`, with `setup` applied to its memory after start().
+function idleRunner(prefix: ForthToken[], words: ForthWord[], setup?: (memory: Uint8Array) => void) {
+  const loop = 0x1000 + prefix.length * 4;
+  const tokens = [...prefix, { addr: loop, addrHex: `0x${loop.toString(16)}`, cfa: 0x1660, cfaHex: '0x1660', name: 'AGAIN', kind: 'branch' as const, arg: loop }];
+  const runner = new ForthBootRunner(new ForthEngine([...words, word('TEST', 0x0937, CODE_CALL, tokens)]), new Uint8Array(0x200), { stara: new Uint8Array(), starb: new Uint8Array() });
+  runner.start(0x0937);
+  if (setup) {
+    const checkpoint = runner.saveState();
+    setup(checkpoint.physicalMemory);
+    runner.loadState(checkpoint);
+    runner.takeSpeakerEvents(); // the restored (silent) state
+  }
+  return runner;
+}
+
+test('TONE, BEEPON and BEEPOFF report timed speaker changes', () => {
+  const tone = word('TONE', 0x2616, 0x2618), on = word('BEEPON', 0x2636, 0x2638), off = word('BEEPOFF', 0x2651, 0x2653);
+  const call = (target: ForthWord, index: number): ForthToken => ({
+    addr: 0x1000 + index * 4, addrHex: `0x${(0x1000 + index * 4).toString(16)}`, cfa: target.cfa, cfaHex: target.cfaHex, name: target.name, kind: 'call'
+  });
+  const runner = idleRunner([
+    { addr: 0x1000, addrHex: '0x1000', cfa: 0, cfaHex: '0x0000', name: '1193', kind: 'lit', arg: 1193 },
+    call(tone, 1), call(on, 2), call(off, 3)
+  ], [tone, on, off]);
+  runner.advance(10);
+  const events = runner.takeSpeakerEvents();
+  assert.deepEqual(events.map(event => [Math.round(event.milliseconds * STEPS_PER_MILLISECOND), Math.round(event.frequency)]), [[3, 1000], [4, 0]]);
+  assert.equal(runner.speakerTone, 0);
+  assert.deepEqual(runner.takeSpeakerEvents(), []);
+});
+
+test('INT 1Ch runs the MUSIC player each timer tick: notes, staccato gaps, rests and phrase repeats', () => {
+  const tick = 0x10000 * 1000 / 1193182;
+  const runner = idleRunner([], [], memory => {
+    const base = 0x50000;
+    memory.set([0xff, 0x00, 0x00, 0x50], 0x70); // INT 1Ch -> 5000:00FF
+    memory.set([0x56, 0x57, 0x1e, 0x52, 0x51, 0x53, 0x50, 0x0e, 0x1f], base + 0xff);
+    memory.set([1, 0, 0, 0x40, 0x01, 0x60, 0x01, 2, 1, 0, 0, 1], base + 2); // ?MUSIC, phrase 140h, notes 160h, 2 repeats
+    memory.set([0xa9, 0x04, 0x52, 0x09], base + 0x24); // SCALE: 1193 (1000 Hz), 2386 (500 Hz)
+    memory.set([2, 0x60, 0x01, 0], base + 0x140); // play the phrase at 160h twice, then stop
+    memory.set([0x02, 0, 0x42, 1, 0x01, 0xff, 0x00], base + 0x160); // 2 ticks, 2 ticks staccato, a 1-tick rest
+  });
+  runner.advance(Math.ceil(13 * tick * STEPS_PER_MILLISECOND));
+  const events = runner.takeSpeakerEvents().map(event => [Math.round(event.milliseconds / tick), Math.round(event.frequency)]);
+  assert.deepEqual(events, [[1, 1000], [3, 500], [4, 0], [6, 1000], [8, 500], [9, 0]]);
+  assert.equal(runner.readMemory(0x5000, 2, 1)[0], 0); // the song ended
+});
+
+test('an unknown INT 1Ch handler stops the run instead of being skipped', () => {
+  const runner = idleRunner([], [], memory => memory.set([0x00, 0x01, 0x00, 0x60], 0x70));
+  runner.advance(Math.ceil(60 * STEPS_PER_MILLISECOND));
+  assert.match(runner.snapshot().stopReason, /INT 1Ch handler at 6000:100 has no TypeScript translation/);
 });
 
 test('CASE: words run as DOES> children and EXECUTE the matching or default entry', () => {

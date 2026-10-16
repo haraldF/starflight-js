@@ -53,10 +53,19 @@ export const CODE_TABLE = 0x5275;      // OVT / IARRAYS parameter table
 export const CODE_SIGFLD = 0x6ec1;     // Signature record field accessor
 
 export const CFA_LIT = 0x175d;         // (LIT): literal constant follows
+export const CFA_2LIT = 0x1616;        // 2LIT: low and high cells of a double literal follow
 export const CFA_0BRANCH = 0x15fa;     // (0BRANCH): conditional jump (IF / UNTIL)
 export const CFA_BRANCH = 0x1660;      // (BRANCH): unconditional jump (ELSE / AGAIN)
 export const CFA_EXIT1 = 0x1690;       // EXIT: return from colon definition (;)
 export const CFA_EXIT2 = 0x79c9;       // RET / EXIT alias
+
+// A code overlay as LOAD-OVERLAY places it: `memory` is a 64K segment image with the overlay's `size` bytes at `storeofs`.
+export interface ForthOverlay {
+  vsa: number; // directory start paragraph; LOAD-OVERLAY stores it in OV#
+  storeofs: number;
+  size: number;
+  memory: Uint8Array;
+}
 
 export class ForthEngine {
   readonly words: ForthWord[] = [];
@@ -64,9 +73,11 @@ export class ForthEngine {
   readonly wordsByModuleAndCfa = new Map<string, ForthWord[]>();
   readonly wordsByName = new Map<string, ForthWord[]>();
   readonly modules: string[] = [];
+  readonly overlays: ReadonlyMap<string, ForthOverlay>;
 
-  constructor(words: ForthWord[]) {
+  constructor(words: ForthWord[], overlays: ReadonlyMap<string, ForthOverlay> = new Map()) {
     this.words = words;
+    this.overlays = overlays;
     const moduleSet = new Set<string>();
 
     for (const w of words) {
@@ -128,6 +139,7 @@ export class ForthEngine {
 
 interface OverlayInfo {
   name: string;
+  vsa: number; // directory start paragraph; LOAD-OVERLAY stores it in OV#
   storeofs: number;
   ovlsize: number;
   vocOffsets: number[];
@@ -241,7 +253,7 @@ export async function createForthEngine(
         if (vocofs !== 0) vocOffsets.push(vocofs);
       }
 
-      overlays.push({ name, storeofs, ovlsize, vocOffsets, buf });
+      overlays.push({ name, vsa: start / 16, storeofs, ovlsize, vocOffsets, buf });
     }
   }
 
@@ -393,6 +405,10 @@ export async function createForthEngine(
         p += 2;
         continue;
       }
+      if (token === CFA_2LIT) {
+        p += 4;
+        continue;
+      }
 
       const name = cfaNameMaps.get(region.module)?.get(token) ?? kernelCfaNameMap.get(token);
       if (name === '(ABORT")' || name === '(.\")' || name === 'SET_STR_AS_PARAM') {
@@ -418,7 +434,9 @@ export async function createForthEngine(
   // 5. Decompile and format all words
   const parsedWords: ForthWord[] = [];
 
-  function decompileColon(mem: Uint8Array, pfa: number, module: string, maxBytes = 256): { decompiled: string; tokens: ForthToken[] } {
+  // Scanning stops at EXIT; maxBytes only bounds words without one. Long definitions such as GAME-OV's SET.DI,
+  // with many inline strings, need more than 256 bytes.
+  function decompileColon(mem: Uint8Array, pfa: number, module: string, maxBytes = 1024): { decompiled: string; tokens: ForthToken[] } {
     const tokens: ForthToken[] = [];
     let p = pfa;
     const bodyWords: string[] = [];
@@ -444,6 +462,18 @@ export async function createForthEngine(
         p += 2;
         tokens.push({ addr, addrHex, cfa, cfaHex, name: signedVal.toString(), kind: 'lit', arg: signedVal });
         bodyWords.push(signedVal.toString());
+        continue;
+      }
+
+      // Double literal: 2LIT pushes the low cell, then the high cell
+      if (cfa === CFA_2LIT) {
+        const low = mem[p] | (mem[p + 1] << 8);
+        const high = mem[p + 2] | (mem[p + 3] << 8);
+        const double = `${(high << 16) | low}.`;
+        p += 4;
+        tokens.push({ addr, addrHex, cfa, cfaHex, name: `${double} (low)`, kind: 'lit', arg: low });
+        tokens.push({ addr: addr + 2, addrHex: `0x${(addr + 2).toString(16).padStart(4, '0')}`, cfa, cfaHex, name: `${double} (high)`, kind: 'lit', arg: high });
+        bodyWords.push(double);
         continue;
       }
 
@@ -682,5 +712,8 @@ export async function createForthEngine(
     }
   }
 
-  return new ForthEngine(parsedWords);
+  return new ForthEngine(parsedWords, new Map(overlays.map(overlay => {
+    const { mem, storeofs, ovlsize } = overlayMemMap.get(overlay.name)!;
+    return [overlay.name, { vsa: overlay.vsa, storeofs, size: ovlsize, memory: mem }];
+  })));
 }

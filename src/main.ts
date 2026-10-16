@@ -5,7 +5,24 @@ import { SystemVisualizer } from './system-visualizer';
 import { createForthEngine, type ForthEngine } from './forth-decompiler';
 import { ForthExplorer } from './forth-explorer';
 import { KernelDisassembler } from './kernel-disassembler';
-import { ForthBootRunner } from './forth-boot';
+import {
+  CP437,
+  ForthBootRunner,
+  STEPS_PER_MILLISECOND,
+  biosKey,
+  type BootState,
+  type ForthGraphicsScreen,
+  type ForthTextScreen
+} from './forth-boot';
+
+// GAME-OV's ?GAME.IN.PROGRESS (:TIMESTAMP @), which START. calls right after the intro screens.
+const INTRO_DONE_CFA = 0xf525;
+
+// The 16 CGA/EGA text colors, indexed by attribute nibble.
+const TEXT_PALETTE = [
+  '#000000', '#0000aa', '#00aa00', '#00aaaa', '#aa0000', '#aa00aa', '#aa5500', '#aaaaaa',
+  '#555555', '#5555ff', '#55ff55', '#55ffff', '#ff5555', '#ff55ff', '#ffff55', '#ffffff'
+];
 
 const RECORDS_PER_PAGE = 20;
 const RAW_CHUNK_SIZE = 512;
@@ -432,6 +449,11 @@ export class ExplorerApp {
 
 class GameScreen {
   private runner: ForthBootRunner;
+  // Keys typed into the current run, and the animation frame that plays it in real time.
+  private keysTyped = 0;
+  private animationFrame = 0;
+  // True while "Skip intro" runs the boot unpaced, until the intro-done breakpoint.
+  private fastForward = false;
 
   constructor(forthEngine: ForthEngine, starflt: Uint8Array, fs: StarflightFS) {
     this.runner = new ForthBootRunner(forthEngine, starflt, fs);
@@ -440,11 +462,13 @@ class GameScreen {
   mount(target: HTMLElement) {
     target.innerHTML = `
       <div class="game-view">
-        <canvas class="game-canvas" width="320" height="200" role="img" aria-label="Starflight game screen, 320 by 200 pixels"></canvas>
+        <canvas class="game-canvas" width="320" height="200" role="img" tabindex="0" aria-label="Starflight game screen, 320 by 200 pixels"></canvas>
         <section class="boot-console">
           <div class="boot-controls">
             <button id="run-forth-boot" class="btn" type="button">Run Forth Boot</button>
-            <span>Entry: W_0x0937 · 16-bit cells · 64K memory</span>
+            <label><input id="auto-ega" type="checkbox" checked> Auto-select EGA</label>
+            <label><input id="skip-intro" type="checkbox" checked> Skip intro</label>
+            <span>Entry: W_0x0937 · 16-bit cells · 64K memory · click the screen and type to send keys</span>
           </div>
           <div id="forth-boot-status" role="status">Ready to start from the first Forth CFA.</div>
           <pre id="forth-boot-trace">Boot trace will appear here.</pre>
@@ -459,16 +483,119 @@ class GameScreen {
     context.fillStyle = '#000000';
     context.fillRect(0, 0, canvas.width, canvas.height);
 
-    target.querySelector('#run-forth-boot')?.addEventListener('click', () => {
-      const result = this.runner.run();
-      const status = target.querySelector<HTMLElement>('#forth-boot-status');
-      const trace = target.querySelector<HTMLElement>('#forth-boot-trace');
-      if (status) status.textContent = `${result.steps} threaded steps · ${result.stopReason}`;
-      if (trace) {
+    const autoEga = target.querySelector<HTMLInputElement>('#auto-ega');
+    const skipIntro = target.querySelector<HTMLInputElement>('#skip-intro');
+    // Answers the display-mode menu with "5. EGA" and Enter before the keys typed on the canvas.
+    const egaKeys = [biosKey('5')!, biosKey('Enter')!];
+
+    const status = target.querySelector<HTMLElement>('#forth-boot-status');
+    const trace = target.querySelector<HTMLElement>('#forth-boot-trace');
+
+    const show = (state: BootState, updateTrace: boolean) => {
+      const result = this.runner.snapshot();
+      if (result.graphics) this.renderGraphicsScreen(canvas, result.graphics);
+      else this.renderTextScreen(canvas, result.screen);
+      const seconds = (result.steps / STEPS_PER_MILLISECOND / 1000).toFixed(1);
+      const keys = `${autoEga?.checked ? 'EGA auto-selected · ' : ''}${this.keysTyped} key(s) typed`;
+      const where = state === 'waiting' ? 'waiting for a key'
+        : state === 'stopped' ? result.stopReason
+        : this.fastForward ? 'skipping the intro at full speed' : 'running';
+      if (status) status.textContent = `${result.steps} threaded steps (${seconds} s emulated) · ${keys} · ${where}`;
+      if (trace && updateTrace) {
         const output = result.output ? `Output: ${result.output}\n\n` : '';
-        trace.textContent = `${output}${result.trace.join('\n')}`;
+        const dropped = result.droppedTraceLines ? `… ${result.droppedTraceLines.toLocaleString()} earlier trace lines dropped; showing the last ${result.trace.length}\n` : '';
+        trace.textContent = `${output}${dropped}${result.trace.join('\n')}`;
       }
+    };
+
+    // Run the boot in real time: each animation frame executes the steps for the time that has passed, so timed
+    // waits such as the intro screens last as long as on the PC. A frame's slice is capped at 100 ms.
+    const play = () => {
+      cancelAnimationFrame(this.animationFrame);
+      this.keysTyped = 0;
+      // With "Skip intro", run unpaced until START. reaches ?GAME.IN.PROGRESS (GAME-OV F525h), right after the
+      // splash, title, and police screens; from there on the game runs in real time.
+      this.fastForward = skipIntro?.checked ?? false;
+      this.runner.clearBreakpoints();
+      if (this.fastForward) this.runner.setBreakpoint('GAME-OV', INTRO_DONE_CFA);
+      this.runner.start(0x0937, autoEga?.checked ? egaKeys : []);
+      let last = performance.now();
+      let lastTrace = 0;
+      let lastState: BootState = 'running';
+      const tick = (now: number) => {
+        const elapsed = Math.min(now - last, 100);
+        last = now;
+        let state: BootState;
+        if (this.fastForward) {
+          // As many steps as fit in about 15 ms, so the page stays responsive and the canvas keeps updating.
+          do state = this.runner.advance(25_000);
+          while (state === 'running' && performance.now() - now < 15);
+          if (state === 'break') {
+            this.fastForward = false;
+            this.runner.clearBreakpoints();
+          }
+        } else {
+          state = this.runner.advance(Math.round(elapsed * STEPS_PER_MILLISECOND));
+        }
+        const updateTrace = state !== lastState || now - lastTrace > 1000;
+        if (updateTrace) lastTrace = now;
+        lastState = state;
+        show(state, updateTrace);
+        if (state !== 'stopped') this.animationFrame = requestAnimationFrame(tick);
+      };
+      this.animationFrame = requestAnimationFrame(tick);
+      canvas.focus();
+    };
+    target.querySelector('#run-forth-boot')?.addEventListener('click', play);
+    autoEga?.addEventListener('change', play);
+    skipIntro?.addEventListener('change', play);
+
+    canvas.addEventListener('keydown', (event) => {
+      if (event.ctrlKey || event.metaKey || event.altKey) return;
+      const key = biosKey(event.key);
+      if (key === undefined) return;
+      event.preventDefault();
+      this.runner.pressKey(key);
+      this.keysTyped++;
     });
+  }
+
+  // Draw an EGA mode 0Dh picture; the default EGA palette maps its 16 color indices to the RGBI text colors.
+  private renderGraphicsScreen(canvas: HTMLCanvasElement, screen: ForthGraphicsScreen) {
+    canvas.width = screen.width;
+    canvas.height = screen.height;
+    canvas.setAttribute('aria-label', `Starflight EGA screen, ${screen.width} by ${screen.height} pixels`);
+    const context = canvas.getContext('2d');
+    if (!context) return;
+    const image = context.createImageData(screen.width, screen.height);
+    const rgb = TEXT_PALETTE.map(color => [1, 3, 5].map(start => parseInt(color.slice(start, start + 2), 16)));
+    screen.pixels.forEach((color, index) => {
+      image.data.set([...rgb[color & 0x0f], 0xff], index * 4);
+    });
+    context.putImageData(image, 0, 0);
+  }
+
+  // Draw a BIOS text screen with 8x8 cells, as on CGA/EGA in 200-line text modes (640x200 for 80 columns).
+  private renderTextScreen(canvas: HTMLCanvasElement, screen: ForthTextScreen) {
+    canvas.width = screen.columns * 8;
+    canvas.height = screen.rows * 8;
+    canvas.setAttribute('aria-label', `Starflight text screen, ${screen.columns} by ${screen.rows} characters`);
+    const context = canvas.getContext('2d');
+    if (!context) return;
+    context.font = '8px "Courier New", monospace';
+    context.textBaseline = 'top';
+    for (let row = 0; row < screen.rows; row++) {
+      for (let col = 0; col < screen.columns; col++) {
+        const cell = screen.cells[row * screen.columns + col];
+        const attribute = cell >>> 8;
+        context.fillStyle = TEXT_PALETTE[(attribute >>> 4) & 0x07]; // bit 7 is blink, not background intensity
+        context.fillRect(col * 8, row * 8, 8, 8);
+        const glyph = CP437[cell & 0xff];
+        if (glyph === ' ') continue;
+        context.fillStyle = TEXT_PALETTE[attribute & 0x0f];
+        context.fillText(glyph, col * 8, row * 8, 8);
+      }
+    }
   }
 
   private containerCanvas(target: HTMLElement): HTMLCanvasElement | null {

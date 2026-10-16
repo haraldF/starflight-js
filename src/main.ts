@@ -433,8 +433,8 @@ export class ExplorerApp {
 class GameScreen {
   private runner: ForthBootRunner;
 
-  constructor(forthEngine: ForthEngine, starflt: Uint8Array) {
-    this.runner = new ForthBootRunner(forthEngine, starflt);
+  constructor(forthEngine: ForthEngine, starflt: Uint8Array, fs: StarflightFS) {
+    this.runner = new ForthBootRunner(forthEngine, starflt, fs);
   }
 
   mount(target: HTMLElement) {
@@ -489,7 +489,7 @@ class MainApp {
     this.systemVisualizer = new SystemVisualizer(systems);
     this.forthExplorer = new ForthExplorer(forthEngine);
     this.kernelDisassembler = new KernelDisassembler(starflt);
-    this.gameScreen = new GameScreen(forthEngine, starflt);
+    this.gameScreen = new GameScreen(forthEngine, starflt, fs);
   }
 
 

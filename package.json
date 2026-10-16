@@ -6,6 +6,8 @@
   "scripts": {
     "dev": "vite",
     "inspect": "node scripts/inspect.ts",
+    "typecheck-cli": "tsc --ignoreConfig --noEmit --module nodenext --target es2023 --types node --allowImportingTsExtensions --skipLibCheck scripts/inspect.ts scripts/forth-boot.test.ts",
+    "test-boot": "node --test scripts/forth-boot.test.ts",
     "build": "tsc && vite build",
     "preview": "vite preview"
   },

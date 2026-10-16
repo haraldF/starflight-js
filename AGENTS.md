@@ -31,6 +31,7 @@ npm run inspect -- word 0x0937 --module KERNEL
 npm run inspect -- boot --steps 50000
 npm run inspect -- boot --entry 0x0937 --steps 100
 npm run inspect -- boot --steps 500000 --keys '5{Enter}'
+npm run inspect -- boot --steps 6000000 --keys '5{Enter}' --key-at '4800000:{ArrowRight}'
 ```
 
 - `word` prints the word's module, CFA, PFA, code pointer, type, and decompiled
@@ -57,7 +58,9 @@ npm run inspect -- boot --steps 500000 --keys '5{Enter}'
   reached through far-call stubs like `0x9125` (`call far 76d6:04fb`).
 - In EGA mode `boot` prints a thumbnail of the visible page (one hex color per
   4x4 block) instead of the text screen; `--page <seg>` shows another page,
-  such as the hidden page `0xa200`.
+  such as the hidden page `0xa200`. `--crop <x,y,w,h>` (screen pixels from the
+  top left) prints just that rectangle at one hex digit per 2x1 pixels, which
+  is enough to see sprites such as the starport crew member.
 - `code` lists every word whose code pointer equals the given address, for
   example all user-vectored words sharing code `0x17b7`. `--module` filters it.
 - `--module` defaults to `KERNEL`; it selects the lookup module for `word`,
@@ -88,7 +91,10 @@ npm run inspect -- boot --steps 500000 --keys '5{Enter}'
   threaded body after the call; read it with `dump <codep+3>` and `word <cell>`.
 - CFAs missing from the dictionary are inferred from their code field in
   runtime memory, in the kernel or the loaded overlay: constants, variables,
-  user variables, and headerless CODE (`codep == PFA`).
+  user variables, headerless CODE (`codep == PFA`), DOES> children (code field
+  calls `0x1649`), and colon definitions (`0x224c`, decoded from memory once
+  per run). Both the decompiler and the runner keep decoding past an EXIT that
+  a forward branch jumps over (`IF ... EXIT THEN ...`).
   Headerless CODE runs through the code-pointer cases in `executePrimitive`, so
   implement one there after checking it with `disasm <PFA>`.
 - The data stack lives in emulated memory, as on the 8086: it grows down from the
@@ -136,6 +142,11 @@ npm run inspect -- boot --steps 500000 --keys '5{Enter}'
   a double millisecond counter (high cell at `0x188`, low at `0x18a`). The
   intro's timed waits mean that with `--keys '5{Enter}'` boot needs about 4.7
   million steps, so pass a large `--steps` and pipe through `tail`.
+- `--key-at <step>:<keys>` (repeatable) presses keys once the run reaches that
+  step, or earlier if `(KEY)` is already waiting, so input during play can be
+  reproduced deterministically (`--keys` types everything ahead, which skips
+  the intro waits). With `5{Enter}`, the starport polls the keyboard from about
+  step 4,705,000; `run()` takes the same list as `timedKeys`.
 - The runner presets `?EGA` (`0x5da3`) to 1, as if EGA had been chosen in the
   `GAME-OV` display menu; the shipped image starts with 0 (CGA). Pass `--cga` to
   `boot` (or `{ ega: false }` to `ForthBootRunner`) to keep the image default.

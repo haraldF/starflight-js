@@ -3,7 +3,7 @@
 import { readFile } from 'node:fs/promises';
 import { parseArgs } from 'node:util';
 import { createForthEngine } from '../src/forth-decompiler.ts';
-import { BIOS_KEYS, ForthBootRunner, biosKey, screenLines, type ForthGraphicsScreen } from '../src/forth-boot.ts';
+import { BIOS_KEYS, ForthBootRunner, biosKey, screenLines, type ForthGraphicsScreen, type TimedKey } from '../src/forth-boot.ts';
 
 const usage = `Usage: npm run inspect -- <command> [options]
 
@@ -22,9 +22,13 @@ Options:
   --cga                  Boot with the image's CGA default instead of presetting ?EGA
   --keys <text>          Keys typed ahead for boot: characters, or {Enter}, {Escape},
                          {ArrowUp}, {F1}, ... (KeyboardEvent.key names)
+  --key-at <step>:<text> Press keys once the run reaches a step (repeatable), e.g.
+                         --key-at '4800000:{ArrowRight}'; same key syntax as --keys
   --segment <seg>        dump/disasm runtime memory at seg:address after a boot run
                          (takes --steps, --keys, --cga, --entry)
   --page <seg>           boot: preview this EGA page instead of the visible one (e.g. 0xa200)
+  --crop <x,y,w,h>       boot: preview only this EGA rectangle (screen pixels from the top left),
+                         one hex digit per 2x1 pixels
   --trace-lines <n|all>  boot: keep only the last n trace lines (default: 1024)
   --bytes <count>        Disassembly/dump byte limit (default: 128 / 64)
   --count <count>        Disassembly instruction limit (default: 32)
@@ -39,7 +43,18 @@ Examples:
   npm run inspect -- disasm 0x9125 --segment 0x0192 --steps 200000 --keys '5{Enter}'
   npm run inspect -- code 0x17b7
   npm run inspect -- boot --steps 50000
-  npm run inspect -- boot --steps 500000 --keys '5{Enter}'`;
+  npm run inspect -- boot --steps 500000 --keys '5{Enter}'
+  npm run inspect -- boot --steps 6000000 --keys '5{Enter}' --key-at '4800000:{ArrowRight}'`;
+
+// Parse --key-at values, `<step>:<keys>`, into keys pressed at that step.
+function parseTimedKeys(values: readonly string[]): TimedKey[] {
+  return values.flatMap(value => {
+    const match = /^(0x[0-9a-f]+|[0-9]+):(.+)$/i.exec(value);
+    if (!match) throw new Error(`--key-at expects <step>:<keys>, got ${JSON.stringify(value)}.`);
+    const step = parseInteger(match[1], '--key-at step', 0, Number.MAX_SAFE_INTEGER);
+    return parseKeys(match[2]).map(key => ({ step, key }));
+  });
+}
 
 // Parse --keys text into BIOS keyboard words; `{Name}` is a named key, anything else types itself.
 function parseKeys(text: string): number[] {
@@ -69,6 +84,37 @@ function graphicsPreview(graphics: ForthGraphicsScreen): string[] {
         for (let x = blockX; x < Math.min(blockX + 4, graphics.width); x++) counts[graphics.pixels[y * graphics.width + x] & 0x0f]++;
       }
       const color = counts.indexOf(Math.max(...counts));
+      line += color === 0 ? '.' : color.toString(16);
+    }
+    lines.push(line);
+  }
+  return lines;
+}
+
+interface Crop {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+}
+
+function parseCrop(value: string, graphics: ForthGraphicsScreen): Crop {
+  const parts = value.split(',').map(part => parseInteger(part.trim(), '--crop', 0, 0xffff));
+  if (parts.length !== 4) throw new Error('--crop expects x,y,w,h.');
+  const [x, y, width, height] = parts;
+  if (width < 1 || height < 1 || x + width > graphics.width || y + height > graphics.height) {
+    throw new Error(`--crop must lie within ${graphics.width}x${graphics.height}.`);
+  }
+  return { x, y, width, height };
+}
+
+// One hex digit per 2x1 pixels (one logical pixel of the 160x200 grid), '.' for black.
+function cropPreview(graphics: ForthGraphicsScreen, crop: Crop): string[] {
+  const lines: string[] = [];
+  for (let y = crop.y; y < crop.y + crop.height; y++) {
+    let line = '';
+    for (let x = crop.x; x < crop.x + crop.width; x += 2) {
+      const color = graphics.pixels[y * graphics.width + x] & 0x0f;
       line += color === 0 ? '.' : color.toString(16);
     }
     lines.push(line);
@@ -173,8 +219,10 @@ async function main(): Promise<void> {
       steps: { type: 'string' },
       cga: { type: 'boolean' },
       keys: { type: 'string' },
+      'key-at': { type: 'string', multiple: true },
       segment: { type: 'string' },
       page: { type: 'string' },
+      crop: { type: 'string' },
       'trace-lines': { type: 'string' },
       bytes: { type: 'string' },
       count: { type: 'string' },
@@ -200,11 +248,14 @@ async function main(): Promise<void> {
   if (runtime && values.module !== undefined) {
     throw new Error('--segment reads runtime memory; it cannot be combined with --module.');
   }
-  if (command !== 'boot' && !runtime && (values.entry !== undefined || values.steps !== undefined || values.cga !== undefined || values.keys !== undefined)) {
-    throw new Error('--entry, --steps, --cga, and --keys are only valid for boot, or for dump and disasm with --segment.');
+  if (command !== 'boot' && !runtime && (values.entry !== undefined || values.steps !== undefined || values.cga !== undefined || values.keys !== undefined || values['key-at'] !== undefined)) {
+    throw new Error('--entry, --steps, --cga, --keys, and --key-at are only valid for boot, or for dump and disasm with --segment.');
   }
   if (command === 'boot' && values.module !== undefined) {
     throw new Error('--module is not valid for boot.');
+  }
+  if (command !== 'boot' && values.crop !== undefined) {
+    throw new Error('--crop is only valid for boot.');
   }
   if (command !== 'boot' && values.page !== undefined) {
     throw new Error('--page is only valid for boot.');
@@ -214,6 +265,7 @@ async function main(): Promise<void> {
   }
   const traceOption = values['trace-lines'] ?? '1024';
   const traceLines = traceOption === 'all' ? Infinity : parseInteger(traceOption, '--trace-lines', 0, Number.MAX_SAFE_INTEGER);
+  const timedKeys = parseTimedKeys(values['key-at'] ?? []);
   const entry = parseInteger(values.entry ?? '0x0937', '--entry', 0, 0xffff);
   const steps = parseInteger(values.steps ?? '50000', '--steps', 1, Number.MAX_SAFE_INTEGER);
   const runBoot = async () => {
@@ -222,7 +274,7 @@ async function main(): Promise<void> {
       stara: new Uint8Array(stara),
       starb: new Uint8Array(starb)
     }, { ega: !values.cga, traceLines });
-    return { runner, result: runner.run(entry, steps, parseKeys(values.keys ?? '')) };
+    return { runner, result: runner.run(entry, steps, parseKeys(values.keys ?? ''), timedKeys) };
   };
   // Runtime memory: boot first, then read the segment as the run left it.
   const loadRuntimeSegment = async (): Promise<Segment> => {
@@ -259,10 +311,14 @@ async function main(): Promise<void> {
     const page = values.page === undefined ? undefined : parseInteger(values.page, '--page', 0xa000, 0xafff);
     const graphics = page === undefined ? result.graphics : runner.graphicsPage(page);
     if (graphics) {
-      const lines = graphicsPreview(graphics);
+      const crop = values.crop === undefined ? undefined : parseCrop(values.crop, graphics);
+      const lines = crop ? cropPreview(graphics, crop) : graphicsPreview(graphics);
       const border = `+${'-'.repeat(lines[0].length)}+`;
       const where = `page ${(page ?? 0xa000).toString(16)}:0000`;
-      console.log(`EGA graphics, ${where} (${graphics.width}x${graphics.height}; each character is the main color of a 4x4 block, . = black):\n${border}`);
+      const scale = crop
+        ? `x ${crop.x}-${crop.x + crop.width - 1}, y ${crop.y}-${crop.y + crop.height - 1} from the top; one hex digit per 2x1 pixels`
+        : 'each character is the main color of a 4x4 block';
+      console.log(`EGA graphics, ${where} (${graphics.width}x${graphics.height}; ${scale}, . = black):\n${border}`);
       for (const line of lines) console.log(`|${line}|`);
       console.log(`${border}\n`);
     } else {

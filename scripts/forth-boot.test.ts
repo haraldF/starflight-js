@@ -7,6 +7,8 @@ import { EgaAdapter } from '../src/ega.ts';
 
 type Operation = number | string;
 
+const CODE_POINTERS: Record<string, number> = { 'LC@': 0x2ecd, 'C!': 0x0c60 };
+
 function createRunner(operations: Operation[], stara: Uint8Array, starb: Uint8Array): ForthBootRunner {
   const names = ['R/W', 'LC@', 'LC!', 'C@', 'C!'];
   const primitives: ForthWord[] = names.map((name, index) => ({
@@ -15,8 +17,9 @@ function createRunner(operations: Operation[], stara: Uint8Array, starb: Uint8Ar
     cfaHex: `0x${(0x200 + index * 2).toString(16)}`,
     pfa: 0,
     pfaHex: '0x0000',
-    codep: name === 'LC@' ? 0x2ecd : 0,
-    codepHex: name === 'LC@' ? '0x2ecd' : '0x0000',
+    // Primitives the runner dispatches by code pointer need their real one.
+    codep: CODE_POINTERS[name] ?? 0,
+    codepHex: `0x${(CODE_POINTERS[name] ?? 0).toString(16).padStart(4, '0')}`,
     module: 'KERNEL',
     type: 'primitive',
     typeLabel: 'test primitive',
@@ -663,6 +666,65 @@ test('{BLT} draws a 1-bit bitmap MSB first, rows going down, clipping columns wi
   assert.deepEqual(draw(1), ['0090', '0900']); // column 0 clipped; the remaining bits stay aligned
 });
 
+test('LLINE walks from (x2, y2) to (x1, y1) with the driver\'s Bresenham steps', () => {
+  const lores = word('>LORES', 0x8d89, 0x8d8b);
+  const line = word('LLINE', 0x903d, 0x903f);
+  const lit = (addr: number, value: number): ForthToken => ({ addr, addrHex: `0x${addr.toString(16)}`, cfa: 0, cfaHex: '0x0000', name: String(value), kind: 'lit', arg: value });
+  const call = (addr: number, target: ForthWord): ForthToken => ({ addr, addrHex: `0x${addr.toString(16)}`, cfa: target.cfa, cfaHex: target.cfaHex, name: target.name, kind: 'call' });
+  // 0 0 4 2 LLINE: from (4, 2) to (0, 0), x major (4), minor 2, threshold 1
+  const entry = word('TEST', 0x0937, CODE_CALL, [
+    call(0x1000, lores), lit(0x1002, 0), lit(0x1006, 0), lit(0x100a, 4), lit(0x100e, 2), call(0x1012, line),
+    { addr: 0x1014, addrHex: '0x1014', cfa: CFA_EXIT1, cfaHex: '0x1690', name: ';', kind: 'exit' }
+  ]);
+  const image = new Uint8Array(0x9400);
+  const pokeWord = (address: number, value: number) => image.set([value & 0xff, value >> 8], address - 0x100);
+  pokeWord(0x584a, 3); // MONITOR = RGB
+  pokeWord(0x55f2, 9); // COLOR
+  pokeWord(0x5648, 0xa000); // BUF-SEG
+  pokeWord(0x563a, 0x6100); // YTABL
+  for (let row = 0; row < 4; row++) pokeWord(0x6100 + row * 2, row * 40);
+  image.set([0xc0, 0, 0x30, 0, 0x0c, 0, 0x03, 0], 0x92cf - 0x100);
+  pokeWord(0x52a5, 0x0800); // REMSEG for the patched driver bytes
+  const result = runImage([lores, line, entry], image);
+  assert.equal(result.stopReason, 'Forth returned from the entry word.', result.trace.join('\n'));
+  assert.match(result.trace[5], /line 4,2 to 0,0 color 9$/);
+  const row = (y: number) => Array.from({ length: 5 }, (_, x) => result.graphics!.pixels[y * 320 + x * 2].toString(16)).join('');
+  // x steps every point; the error (+2 each) passes the threshold 1 on steps 1 and 3, stepping y:
+  // (4,2) (3,1) (2,1) (1,0) (0,0)
+  assert.deepEqual([row(2), row(1), row(0)], ['00009', '00990', '99000']);
+});
+
+test('LCOPYBLK copies a block row by row towards its destination, so overlapping copies keep the source', () => {
+  const lores = word('>LORES', 0x8d89, 0x8d8b);
+  const line = word('LLINE', 0x903d, 0x903f);
+  const copy = word('LCOPYBLK', 0x9069, 0x906b);
+  const tokens: ForthToken[] = [];
+  let addr = 0x1000;
+  const lit = (value: number) => { tokens.push({ addr, addrHex: `0x${addr.toString(16)}`, cfa: 0, cfaHex: '0x0000', name: String(value), kind: 'lit', arg: value }); addr += 4; };
+  const call = (target: ForthWord) => { tokens.push({ addr, addrHex: `0x${addr.toString(16)}`, cfa: target.cfa, cfaHex: target.cfaHex, name: target.name, kind: 'call' }); addr += 2; };
+  call(lores);
+  [0, 0, 3, 0].forEach(lit); call(line); // row 0, x 0-3
+  [0, 1, 0, 1].forEach(lit); call(line); // row 1, x 0
+  [0, 1, 3, 0, 4, 2].forEach(lit); call(copy); // rows 0-1, x 0-3 to x 4, rows 1-2
+  tokens.push({ addr, addrHex: `0x${addr.toString(16)}`, cfa: CFA_EXIT1, cfaHex: '0x1690', name: ';', kind: 'exit' });
+  const entry = word('TEST', 0x0937, CODE_CALL, tokens);
+  const image = new Uint8Array(0x9400);
+  const pokeWord = (address: number, value: number) => image.set([value & 0xff, value >> 8], address - 0x100);
+  pokeWord(0x584a, 3); // MONITOR = RGB
+  pokeWord(0x55f2, 9); // COLOR
+  pokeWord(0x5648, 0xa000); // BUF-SEG
+  pokeWord(0x563a, 0x6100); // YTABL
+  for (let row = 0; row < 4; row++) pokeWord(0x6100 + row * 2, row * 40);
+  image.set([0xc0, 0, 0x30, 0, 0x0c, 0, 0x03, 0], 0x92cf - 0x100);
+  pokeWord(0x52a5, 0x0800); // REMSEG for the patched driver bytes
+  const result = runImage([lores, line, copy, entry], image);
+  assert.equal(result.stopReason, 'Forth returned from the entry word.', result.trace.join('\n'));
+  const row = (y: number) => Array.from({ length: 8 }, (_, x) => result.graphics!.pixels[y * 320 + x * 2].toString(16)).join('');
+  // The destination (high row 2) is above the source's high row 1, so rows go 1 -> 2, then 0 -> 1:
+  // row 1's copy reads the original row 0, not the copy of row 1.
+  assert.deepEqual([row(0), row(1), row(2)], ['99990000', '90009999', '00009000']);
+});
+
 test('(KEY) reads the typed-ahead queue and stops when it is empty', () => {
   const key = word('(KEY)', 0x25d5, 0x25d7);
   const terminal = word('(?TERMINAL)', 0x25ba, 0x25bc);
@@ -729,6 +791,91 @@ test('DOES> words push their PFA and run the threaded body after call DODOES', (
   assert.match(result.trace[1], /\[0x0061 0x0502\] DOES> FIELD$/);
   // 0x61 is entry 1 of the third directory block: offset 21, block DIRBLK + 2.
   assert.match(result.trace.at(-2)!, /\[0x0061 0x0015 0x000c\] return$/);
+});
+
+test('EXECUTE runs a DOES> word\'s threaded body, like a direct call', () => {
+  const fetchByte = word('C@', 0x0c92, 0x0c94);
+  const execute = word('EXECUTE', 0x1682, 0x1684);
+  const field = word('FIELD', 0x0500, 0x0600);
+  const entry = word('TEST', 0x0937, CODE_CALL, [
+    { addr: 0x1000, addrHex: '0x1000', cfa: 0, cfaHex: '0x0000', name: String(field.pfa), kind: 'lit', arg: field.pfa },
+    { addr: 0x1004, addrHex: '0x1004', cfa: execute.cfa, cfaHex: execute.cfaHex, name: execute.name, kind: 'call' },
+    { addr: 0x1006, addrHex: '0x1006', cfa: CFA_EXIT1, cfaHex: '0x1690', name: ';', kind: 'exit' }
+  ]);
+  const image = new Uint8Array(0x5400);
+  const poke = (address: number, ...bytes: number[]) => image.set(bytes, address - 0x100);
+  poke(field.pfa, 0x61);
+  const rel = (0x1649 - 0x0603) & 0xffff;
+  poke(0x0600, 0xe8, rel & 0xff, rel >> 8, 0x92, 0x0c, 0x90, 0x16); // call DODOES; C@ ;
+  const result = runImage([fetchByte, execute, field, entry], image);
+  assert.equal(result.stopReason, 'Forth returned from the entry word.', result.trace.join('\n'));
+  assert.match(result.trace[1], /\[0x0502\] EXECUTE DOES> FIELD@KERNEL$/);
+  assert.match(result.trace.at(-2)!, /\[0x0061\] return$/);
+});
+
+test('BVSA>OFFBLK splits paragraphs above 3E80h into a byte offset and a 1,024-byte block', () => {
+  const split = word('BVSA>OFFBLK', 0x7293, 0x7295);
+  const entry = word('TEST', 0x0937, CODE_CALL, [
+    { addr: 0x1000, addrHex: '0x1000', cfa: 0, cfaHex: '0x0000', name: '16071', kind: 'lit', arg: 0x3ec7 },
+    { addr: 0x1004, addrHex: '0x1004', cfa: split.cfa, cfaHex: split.cfaHex, name: split.name, kind: 'call' },
+    { addr: 0x1006, addrHex: '0x1006', cfa: 0, cfaHex: '0x0000', name: '16000', kind: 'lit', arg: 0x3e7f },
+    { addr: 0x100a, addrHex: '0x100a', cfa: split.cfa, cfaHex: split.cfaHex, name: split.name, kind: 'call' },
+    { addr: 0x100c, addrHex: '0x100c', cfa: CFA_EXIT1, cfaHex: '0x1690', name: ';', kind: 'exit' }
+  ]);
+  const result = runImage([split, entry], new Uint8Array(0x5400));
+  assert.equal(result.stopReason, 'Forth returned from the entry word.', result.trace.join('\n'));
+  // 47h paragraphs: block 1, offset 7 * 16; one paragraph below 3E80h wraps to FFFFh.
+  assert.match(result.trace.at(-2)!, /\[0x0070 0x0001 0x03f0 0x03ff\] return$/);
+});
+
+test('a call to ICLOSE (0x79c9) runs the colon word instead of returning', () => {
+  const close = word('ICLOSE', 0x79c9, CODE_CALL, [
+    { addr: 0x79cb, addrHex: '0x79cb', cfa: 0, cfaHex: '0x0000', name: '5', kind: 'lit', arg: 5 },
+    { addr: 0x79cf, addrHex: '0x79cf', cfa: CFA_EXIT1, cfaHex: '0x1690', name: ';', kind: 'exit' }
+  ]);
+  const entry = word('TEST', 0x0937, CODE_CALL, [
+    { addr: 0x1000, addrHex: '0x1000', cfa: close.cfa, cfaHex: close.cfaHex, name: close.name, kind: 'call' },
+    { addr: 0x1002, addrHex: '0x1002', cfa: 0, cfaHex: '0x0000', name: '7', kind: 'lit', arg: 7 },
+    { addr: 0x1006, addrHex: '0x1006', cfa: CFA_EXIT1, cfaHex: '0x1690', name: ';', kind: 'exit' }
+  ]);
+  const result = runImage([close, entry], new Uint8Array(0x8000));
+  assert.equal(result.stopReason, 'Forth returned from the entry word.', result.trace.join('\n'));
+  assert.match(result.trace.at(-2)!, /\[0x0005 0x0007\] return$/);
+});
+
+test('S->D sign-extends a cell into a double', () => {
+  const extend = word('S->D', 0x1506, 0x1508);
+  const entry = word('TEST', 0x0937, CODE_CALL, [
+    { addr: 0x1000, addrHex: '0x1000', cfa: 0, cfaHex: '0x0000', name: '-2', kind: 'lit', arg: 0xfffe },
+    { addr: 0x1004, addrHex: '0x1004', cfa: extend.cfa, cfaHex: extend.cfaHex, name: extend.name, kind: 'call' },
+    { addr: 0x1006, addrHex: '0x1006', cfa: 0, cfaHex: '0x0000', name: '32767', kind: 'lit', arg: 0x7fff },
+    { addr: 0x100a, addrHex: '0x100a', cfa: extend.cfa, cfaHex: extend.cfaHex, name: extend.name, kind: 'call' },
+    { addr: 0x100c, addrHex: '0x100c', cfa: CFA_EXIT1, cfaHex: '0x1690', name: ';', kind: 'exit' }
+  ]);
+  const result = runImage([extend, entry], new Uint8Array(0x5400));
+  assert.equal(result.stopReason, 'Forth returned from the entry word.', result.trace.join('\n'));
+  assert.match(result.trace.at(-2)!, /\[0xfffe 0xffff 0x7fff 0x0000\] return$/);
+});
+
+test('DOES> bodies may branch: C@ IF 7 THEN', () => {
+  const fetchByte = word('C@', 0x0c92, 0x0c94);
+  const off = word('FLAG-OFF', 0x0500, 0x0600);
+  const on = word('FLAG-ON', 0x0510, 0x0600);
+  const call = (addr: number, target: ForthWord): ForthToken => ({ addr, addrHex: `0x${addr.toString(16)}`, cfa: target.cfa, cfaHex: target.cfaHex, name: target.name, kind: 'call' });
+  const entry = word('TEST', 0x0937, CODE_CALL, [
+    call(0x1000, off), call(0x1002, on),
+    { addr: 0x1004, addrHex: '0x1004', cfa: CFA_EXIT1, cfaHex: '0x1690', name: ';', kind: 'exit' }
+  ]);
+  const image = new Uint8Array(0x800);
+  const poke = (address: number, ...bytes: number[]) => image.set(bytes, address - 0x100);
+  const rel = (0x1649 - 0x0603) & 0xffff;
+  // call DODOES; C@ 0BRANCH (+6: to EXIT) LIT 7 ;
+  poke(0x0600, 0xe8, rel & 0xff, rel >> 8, 0x92, 0x0c, 0xfa, 0x15, 0x06, 0x00, 0x5d, 0x17, 0x07, 0x00, 0x90, 0x16);
+  poke(off.pfa, 0);
+  poke(on.pfa, 1);
+  const result = runImage([fetchByte, off, on, entry], image);
+  assert.equal(result.stopReason, 'Forth returned from the entry word.', result.trace.join('\n'));
+  assert.match(result.trace.at(-2)!, /\[0x0007\] return$/); // only FLAG-ON pushes 7
 });
 
 test('inline 2LIT in a DOES> body pushes the low cell, then the high cell', () => {
@@ -838,6 +985,37 @@ test('a started run advances in slices, pauses in (KEY), and resumes when a key 
   assert.match(result.trace.at(-2)!, /\[0x0007 0x0041 0x0042\] return$/);
 });
 
+test('pressKey keeps at most 15 keys waiting, like the BIOS keyboard buffer', () => {
+  const runner = new ForthBootRunner(new ForthEngine([word('TEST', 0x0937, CODE_CALL, [])]), new Uint8Array(), { stara: new Uint8Array(), starb: new Uint8Array() });
+  runner.start();
+  const accepted = Array.from({ length: 20 }, () => runner.pressKey(biosKey('ArrowUp')!));
+  assert.equal(accepted.filter(Boolean).length, 15);
+  assert.equal(runner.pendingKeys, 15);
+  assert.equal(accepted[15], false);
+});
+
+test('run() presses timed keys at their step, or as soon as (KEY) waits for one', () => {
+  const key = word('(KEY)', 0x25d5, 0x25d7);
+  const terminal = word('(?TERMINAL)', 0x25ba, 0x25bc);
+  const call = (target: ForthWord, index: number): ForthToken => ({
+    addr: 0x1000 + index * 2, addrHex: `0x${(0x1000 + index * 2).toString(16)}`, cfa: target.cfa, cfaHex: target.cfaHex, name: target.name, kind: 'call'
+  });
+  // ?TERMINAL ?TERMINAL ?TERMINAL (KEY) ;
+  const entry = word('TEST', 0x0937, CODE_CALL, [
+    call(terminal, 0), call(terminal, 1), call(terminal, 2), call(key, 3),
+    { addr: 0x1008, addrHex: '0x1008', cfa: CFA_EXIT1, cfaHex: '0x1690', name: ';', kind: 'exit' }
+  ]);
+  const runner = new ForthBootRunner(new ForthEngine([key, terminal, entry]), new Uint8Array(), { stara: new Uint8Array(), starb: new Uint8Array() });
+  // 'A' arrives once two steps have run: only the third ?TERMINAL sees it, and (KEY) then reads it.
+  const midRun = runner.run(0x0937, 100, [], [{ step: 2, key: biosKey('A')! }]);
+  assert.equal(midRun.stopReason, 'Forth returned from the entry word.', midRun.trace.join('\n'));
+  assert.match(midRun.trace.at(-2)!, /\[0x0000 0x0000 0x0001 0x0041\] return$/);
+  // 'B' is due at step 50, but (KEY) is already waiting at step 3, so it is pressed then.
+  const early = runner.run(0x0937, 100, [], [{ step: 50, key: biosKey('B')! }]);
+  assert.equal(early.stopReason, 'Forth returned from the entry word.');
+  assert.match(early.trace.at(-2)!, /\[0x0000 0x0000 0x0000 0x0042\] return$/);
+});
+
 test('breakpoints pause advance() before each call to the word, and the next advance() makes the call', () => {
   const lit = (addr: number, value: number): ForthToken => ({ addr, addrHex: `0x${addr.toString(16)}`, cfa: 0, cfaHex: '0x0000', name: String(value), kind: 'lit', arg: value });
   const exit = (addr: number): ForthToken => ({ addr, addrHex: `0x${addr.toString(16)}`, cfa: CFA_EXIT1, cfaHex: '0x1690', name: ';', kind: 'exit' });
@@ -857,6 +1035,18 @@ test('breakpoints pause advance() before each call to the word, and the next adv
   assert.equal(runner.run().stopReason, 'Forth returned from the entry word.');
 });
 
+test('0> is true for positive cells, and for 8000h as on the 8086', () => {
+  const positive = word('0>', 0x129f, 0x12a1);
+  const tokens: ForthToken[] = [];
+  [5, 0, 0xffff, 0x8000].forEach((value, index) => {
+    tokens.push({ addr: 0x1000 + index * 6, addrHex: '0x1000', cfa: 0, cfaHex: '0x0000', name: String(value), kind: 'lit', arg: value });
+    tokens.push({ addr: 0x1004 + index * 6, addrHex: '0x1004', cfa: positive.cfa, cfaHex: positive.cfaHex, name: positive.name, kind: 'call' });
+  });
+  tokens.push({ addr: 0x1100, addrHex: '0x1100', cfa: CFA_EXIT1, cfaHex: '0x1690', name: ';', kind: 'exit' });
+  const result = runImage([positive, word('TEST', 0x0937, CODE_CALL, tokens)], new Uint8Array());
+  assert.match(result.trace.at(-2)!, /\[0x0001 0x0000 0x0000 0x0001\] return$/);
+});
+
 test('U* multiplies unsigned cells into a double, low cell first', () => {
   const multiply = word('U*', 0x11d6, 0x11d8);
   const lit = (addr: number, value: number): ForthToken => ({ addr, addrHex: `0x${addr.toString(16)}`, cfa: 0, cfaHex: '0x0000', name: String(value), kind: 'lit', arg: value });
@@ -867,6 +1057,145 @@ test('U* multiplies unsigned cells into a double, low cell first', () => {
   ]);
   const result = runImage([multiply, entry], new Uint8Array());
   assert.match(result.trace.at(-2)!, /\[0x0001 0xfffe\] return$/); // FFFFh * FFFFh = FFFE0001h
+});
+
+test('the context stack keeps 3-byte entries below CXSP: >C, CDEPTH, CI, C>', () => {
+  const toContext = word('>C', 0x753d, 0x753f);
+  const fromContext = word('C>', 0x7558, 0x755a);
+  const top = word('CI', 0x7575, 0x7577);
+  const depth = word('CDEPTH', 0x75d5, 0x75d7);
+  let addr = 0x1000;
+  const step = (target: ForthWord | number): ForthToken => {
+    const token: ForthToken = typeof target === 'number'
+      ? { addr, addrHex: `0x${addr.toString(16)}`, cfa: 0, cfaHex: '0x0000', name: String(target), kind: 'lit', arg: target }
+      : { addr, addrHex: `0x${addr.toString(16)}`, cfa: target.cfa, cfaHex: target.cfaHex, name: target.name, kind: 'call' };
+    addr += 4;
+    return token;
+  };
+  // 1234h 56h >C CDEPTH CI C> CDEPTH
+  const entry = word('TEST', 0x0937, CODE_CALL, [
+    step(0x1234), step(0x56), step(toContext), step(depth), step(top), step(fromContext), step(depth),
+    { addr, addrHex: `0x${addr.toString(16)}`, cfa: CFA_EXIT1, cfaHex: '0x1690', name: ';', kind: 'exit' }
+  ]);
+  const image = new Uint8Array(0x6400);
+  image.set([0x98, 0x63], 0x54b0 - 0x100); // CXSP = 6398h, the empty stack
+  const runner = new ForthBootRunner(new ForthEngine([toContext, fromContext, top, depth, entry]), image, { stara: new Uint8Array(), starb: new Uint8Array() });
+  const result = runner.run();
+  assert.equal(result.stopReason, 'Forth returned from the entry word.', result.trace.join('\n'));
+  assert.match(result.trace.at(-2)!, /\[0x0001 0x1234 0x0056 0x1234 0x0056 0x0000\] return$/);
+  assert.deepEqual(Array.from(runner.readMemory(0x0192, 0x6398, 3)), [0x34, 0x12, 0x56]);
+});
+
+test('1.5! and 1.5@ store and fetch a cell plus a byte', () => {
+  const store = word('<1.5!>', 0x4c08, 0x49ae);
+  const fetch = word('1.5@', 0x4995, 0x4997);
+  const lit = (addr: number, value: number): ForthToken => ({ addr, addrHex: `0x${addr.toString(16)}`, cfa: 0, cfaHex: '0x0000', name: String(value), kind: 'lit', arg: value });
+  const call = (addr: number, target: ForthWord): ForthToken => ({ addr, addrHex: `0x${addr.toString(16)}`, cfa: target.cfa, cfaHex: target.cfaHex, name: target.name, kind: 'call' });
+  // 1234h 1FFh 6000h <1.5!>  6000h 1.5@
+  const entry = word('TEST', 0x0937, CODE_CALL, [
+    lit(0x1000, 0x1234), lit(0x1004, 0x01ff), lit(0x1008, 0x6000), call(0x100c, store), lit(0x100e, 0x6000), call(0x1012, fetch),
+    { addr: 0x1014, addrHex: '0x1014', cfa: CFA_EXIT1, cfaHex: '0x1690', name: ';', kind: 'exit' }
+  ]);
+  const runner = new ForthBootRunner(new ForthEngine([store, fetch, entry]), new Uint8Array(), { stara: new Uint8Array(), starb: new Uint8Array() });
+  const result = runner.run();
+  assert.match(result.trace.at(-2)!, /\[0x1234 0x00ff\] return$/); // only the low byte of the high part is kept
+  assert.deepEqual(Array.from(runner.readMemory(0x0192, 0x6000, 3)), [0x34, 0x12, 0xff]);
+});
+
+test('PRIORIT swaps an instance-cache entry with the one before it in all three tables', () => {
+  const priority = word('PRIORIT', 0x7682, 0x7684);
+  const ioff = word('@[IOFF]', 0x7638, 0x763a);
+  const lit = (addr: number, value: number): ForthToken => ({ addr, addrHex: `0x${addr.toString(16)}`, cfa: 0, cfaHex: '0x0000', name: String(value), kind: 'lit', arg: value });
+  const call = (addr: number, target: ForthWord): ForthToken => ({ addr, addrHex: `0x${addr.toString(16)}`, cfa: target.cfa, cfaHex: target.cfaHex, name: target.name, kind: 'call' });
+  const entry = word('TEST', 0x0937, CODE_CALL, [
+    lit(0x1000, 4), call(0x1004, priority), lit(0x1006, 0), call(0x100a, priority), call(0x100c, ioff),
+    { addr: 0x100e, addrHex: '0x100e', cfa: CFA_EXIT1, cfaHex: '0x1690', name: ';', kind: 'exit' }
+  ]);
+  const image = new Uint8Array(0x5600);
+  const poke = (address: number, ...bytes: number[]) => image.set(bytes, address - 0x100);
+  // Tables inside the image: LOISEG = CS:0400h, LOCSEC = CS:0500h (words), HIISEG = CS:0600h (bytes)
+  poke(0x54ea, 0xd2, 0x01);
+  poke(0x54f2, 0xe2, 0x01);
+  poke(0x54ee, 0xf2, 0x01);
+  poke(0x0400, 0xa0, 0, 0xa1, 0, 0xa2, 0);
+  poke(0x0500, 0xb0, 0, 0xb1, 0, 0xb2, 0);
+  poke(0x0600, 0xc0, 0xc1, 0xc2);
+  poke(0x558c, 0x34, 0x12); // [IOFF]
+  const runner = new ForthBootRunner(new ForthEngine([priority, ioff, entry]), image, { stara: new Uint8Array(), starb: new Uint8Array() });
+  const result = runner.run();
+  assert.equal(result.stopReason, 'Forth returned from the entry word.', result.trace.join('\n'));
+  assert.match(result.trace.at(-2)!, /\[0x0002 0x0000 0x1234\] return$/);
+  assert.deepEqual(Array.from(runner.readMemory(0x0192, 0x0400, 6)), [0xa0, 0, 0xa2, 0, 0xa1, 0]);
+  assert.deepEqual(Array.from(runner.readMemory(0x0192, 0x0500, 6)), [0xb0, 0, 0xb2, 0, 0xb1, 0]);
+  assert.deepEqual(Array.from(runner.readMemory(0x0192, 0x0600, 3)), [0xc0, 0xc2, 0xc1]);
+});
+
+test('instance-field words (DOES> IFLDADR) address their offset in the record at 63EFh', () => {
+  const fieldAddress = word('IFLDADR', 0x7423, 0x7425);
+  const field = { ...word('INST-X', 0x0500, 0x744d), type: 'afield' as const };
+  const entry = word('TEST', 0x0937, CODE_CALL, [
+    { addr: 0x1000, addrHex: '0x1000', cfa: field.cfa, cfaHex: field.cfaHex, name: field.name, kind: 'call' },
+    { addr: 0x1002, addrHex: '0x1002', cfa: CFA_EXIT1, cfaHex: '0x1690', name: ';', kind: 'exit' }
+  ]);
+  const image = new Uint8Array(0x7500);
+  const poke = (address: number, ...bytes: number[]) => image.set(bytes, address - 0x100);
+  const rel = (0x1649 - 0x7450) & 0xffff;
+  poke(0x744d, 0xe8, rel & 0xff, rel >> 8, 0x23, 0x74, 0x90, 0x16); // call DODOES; IFLDADR ;
+  poke(field.pfa, 0x00, 0x0b, 0x02); // descriptor: offset 0Bh
+  const result = runImage([fieldAddress, field, entry], image);
+  assert.equal(result.stopReason, 'Forth returned from the entry word.', result.trace.join('\n'));
+  assert.match(result.trace.at(-2)!, /\[0x63fa\] return$/); // 63EFh + 0Bh
+});
+
+test('>V, VI, and V> push, peek, and pop the V stack at VSP', () => {
+  const toV = word('>V', 0x7ae5, 0x7ae7);
+  const fromV = word('V>', 0x7afc, 0x7afe);
+  const peek = word('VI', 0x7b13, 0x7b15);
+  const lit = (addr: number, value: number): ForthToken => ({ addr, addrHex: `0x${addr.toString(16)}`, cfa: 0, cfaHex: '0x0000', name: String(value), kind: 'lit', arg: value });
+  const call = (addr: number, target: ForthWord): ForthToken => ({ addr, addrHex: `0x${addr.toString(16)}`, cfa: target.cfa, cfaHex: target.cfaHex, name: target.name, kind: 'call' });
+  const entry = word('TEST', 0x0937, CODE_CALL, [
+    lit(0x1000, 0x1111), call(0x1004, toV), lit(0x1006, 0x2222), call(0x100a, toV), call(0x100c, peek), call(0x100e, fromV), call(0x1010, peek),
+    { addr: 0x1012, addrHex: '0x1012', cfa: CFA_EXIT1, cfaHex: '0x1690', name: ';', kind: 'exit' }
+  ]);
+  const image = new Uint8Array(0x6400);
+  image.set([0xdf, 0x63], 0x54b4 - 0x100); // VSP as shipped (63DFh)
+  const runner = new ForthBootRunner(new ForthEngine([toV, fromV, peek, entry]), image, { stara: new Uint8Array(), starb: new Uint8Array() });
+  const result = runner.run();
+  assert.equal(result.stopReason, 'Forth returned from the entry word.', result.trace.join('\n'));
+  assert.match(result.trace.at(-2)!, /\[0x2222 0x2222 0x1111\] return$/);
+  assert.deepEqual(Array.from(runner.readMemory(0x0192, 0x54b4, 2)), [0xdd, 0x63]); // one entry left
+});
+
+test('headerless DOES> words are inferred from a code field that calls DODOES', () => {
+  const fieldAddress = word('IFLDADR', 0x7423, 0x7425);
+  const entry = word('TEST', 0x0937, CODE_CALL, [
+    { addr: 0x1000, addrHex: '0x1000', cfa: 0x0500, cfaHex: '0x0500', name: '[.', kind: 'call' }, // not in the dictionary
+    { addr: 0x1002, addrHex: '0x1002', cfa: CFA_EXIT1, cfaHex: '0x1690', name: ';', kind: 'exit' }
+  ]);
+  const image = new Uint8Array(0x7500);
+  const poke = (address: number, ...bytes: number[]) => image.set(bytes, address - 0x100);
+  const rel = (0x1649 - 0x7450) & 0xffff;
+  poke(0x744d, 0xe8, rel & 0xff, rel >> 8, 0x23, 0x74, 0x90, 0x16); // call DODOES; IFLDADR ;
+  poke(0x0500, 0x4d, 0x74, 0x11, 0x11, 0x12); // like CHKFLIGHT-OV's [. at F1B9h: offset 11h
+  const result = runImage([fieldAddress, entry], image);
+  assert.equal(result.stopReason, 'Forth returned from the entry word.', result.trace.join('\n'));
+  assert.match(result.trace.at(-2)!, /\[0x6400\] return$/); // 63EFh + 11h
+});
+
+test('headerless colon words are decoded from memory, including code after an early EXIT', () => {
+  const entry = word('TEST', 0x0937, CODE_CALL, [
+    { addr: 0x1000, addrHex: '0x1000', cfa: 0x0500, cfaHex: '0x0500', name: 'W_0x0500', kind: 'call' }, // not in the dictionary
+    { addr: 0x1002, addrHex: '0x1002', cfa: 0x0600, cfaHex: '0x0600', name: 'W_0x0600', kind: 'call' },
+    { addr: 0x1004, addrHex: '0x1004', cfa: CFA_EXIT1, cfaHex: '0x1690', name: ';', kind: 'exit' }
+  ]);
+  const image = new Uint8Array(0x800);
+  const poke = (address: number, ...bytes: number[]) => image.set(bytes, address - 0x100);
+  poke(0x0500, 0x4c, 0x22, 0x5d, 0x17, 0x07, 0x00, 0x90, 0x16); // : 7 ;
+  // : 0 IF ; THEN 9 ;  -- 0BRANCH at 0606h skips the EXIT at 060Ah to 060Ch
+  poke(0x0600, 0x4c, 0x22, 0x5d, 0x17, 0x00, 0x00, 0xfa, 0x15, 0x04, 0x00, 0x90, 0x16, 0x5d, 0x17, 0x09, 0x00, 0x90, 0x16);
+  const result = runImage([entry], image);
+  assert.equal(result.stopReason, 'Forth returned from the entry word.', result.trace.join('\n'));
+  assert.match(result.trace.at(-2)!, /\[0x0007 0x0009\] return$/);
 });
 
 test('FRND steps SEED with SEED * 7ABDh + 1B0Fh', () => {

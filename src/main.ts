@@ -555,8 +555,10 @@ class GameScreen {
       const key = biosKey(event.key);
       if (key === undefined) return;
       event.preventDefault();
-      this.runner.pressKey(key);
-      this.keysTyped++;
+      // Held keys auto-repeat faster than the game reads them; queueing every repeat would keep the player moving
+      // after the key is released. Repeats only count once the game has taken the previous key.
+      if (event.repeat && this.runner.pendingKeys > 0) return;
+      if (this.runner.pressKey(key)) this.keysTyped++;
     });
   }
 

@@ -57,7 +57,6 @@ export const CFA_2LIT = 0x1616;        // 2LIT: low and high cells of a double l
 export const CFA_0BRANCH = 0x15fa;     // (0BRANCH): conditional jump (IF / UNTIL)
 export const CFA_BRANCH = 0x1660;      // (BRANCH): unconditional jump (ELSE / AGAIN)
 export const CFA_EXIT1 = 0x1690;       // EXIT: return from colon definition (;)
-export const CFA_EXIT2 = 0x79c9;       // RET / EXIT alias
 
 // A code overlay as LOAD-OVERLAY places it: `memory` is a 64K segment image with the overlay's `size` bytes at `storeofs`.
 export interface ForthOverlay {
@@ -174,7 +173,6 @@ export async function createForthEngine(
   kernelCfaNameMap.set(CFA_0BRANCH, '0BRANCH');
   kernelCfaNameMap.set(CFA_BRANCH, 'BRANCH');
   kernelCfaNameMap.set(CFA_EXIT1, 'EXIT');
-  kernelCfaNameMap.set(CFA_EXIT2, 'EXIT');
 
   // 3. Load Kernel Memory Model (STARFLT.COM loaded at 0x100)
   const kernelMem = new Uint8Array(0x10000);
@@ -400,7 +398,7 @@ export async function createForthEngine(
       const token = region.mem[p] | (region.mem[p + 1] << 8);
       p += 2;
 
-      if (token === CFA_EXIT1 || token === CFA_EXIT2) return true;
+      if (token === CFA_EXIT1) return true;
       if (token === CFA_LIT || token === CFA_0BRANCH || token === CFA_BRANCH) {
         p += 2;
         continue;
@@ -440,6 +438,9 @@ export async function createForthEngine(
     const tokens: ForthToken[] = [];
     let p = pfa;
     const bodyWords: string[] = [];
+    // The furthest forward branch target so far: an EXIT before it is an early exit (`IF ... EXIT THEN`), so the
+    // definition continues.
+    let furthestTarget = 0;
 
     while (p < pfa + maxBytes) {
       const cfa = mem[p] | (mem[p + 1] << 8);
@@ -449,9 +450,10 @@ export async function createForthEngine(
       p += 2;
 
       // Exit / Return
-      if (cfa === CFA_EXIT1 || cfa === CFA_EXIT2) {
+      if (cfa === CFA_EXIT1) {
         tokens.push({ addr, addrHex, cfa, cfaHex, name: ';', kind: 'exit' });
         bodyWords.push(';');
+        if (furthestTarget > addr) continue;
         break;
       }
 
@@ -483,6 +485,7 @@ export async function createForthEngine(
         const signedRel = (rel << 16) >> 16;
         p += 2;
         const target = addr + 2 + signedRel;
+        furthestTarget = Math.max(furthestTarget, target);
         tokens.push({ addr, addrHex, cfa, cfaHex, name: `IF [-> 0x${target.toString(16)}]`, kind: 'branch', arg: target });
         bodyWords.push(`IF`);
         continue;
@@ -494,6 +497,7 @@ export async function createForthEngine(
         const signedRel = (rel << 16) >> 16;
         p += 2;
         const target = addr + 2 + signedRel;
+        furthestTarget = Math.max(furthestTarget, target);
         tokens.push({ addr, addrHex, cfa, cfaHex, name: `ELSE [-> 0x${target.toString(16)}]`, kind: 'branch', arg: target });
         bodyWords.push(`ELSE`);
         continue;

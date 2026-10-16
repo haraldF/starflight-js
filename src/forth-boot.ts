@@ -2,7 +2,6 @@ import {
   CFA_0BRANCH,
   CFA_BRANCH,
   CFA_EXIT1,
-  CFA_EXIT2,
   CFA_LIT,
   CFA_2LIT,
   CODE_CALL,
@@ -17,6 +16,12 @@ import {
 } from './forth-decompiler.ts';
 import { BLOCK_SIZE, type StarflightFS } from './starflight-fs.ts';
 import { EgaAdapter } from './ega.ts';
+
+// A BIOS keyboard word to press once a run reaches `step`.
+export interface TimedKey {
+  step: number;
+  key: number;
+}
 
 // 'break': advance() paused before a call to a breakpoint word; the next advance() makes that call and goes on.
 export type BootState = 'running' | 'waiting' | 'break' | 'stopped';
@@ -214,6 +219,8 @@ const OVERLAY_NUMBER = 0x55a5; // OV#: VSA of the overlay LOAD-OVERLAY loaded la
 // The emulated clock: threaded steps per millisecond, a rough rate for this Forth on a 4.77 MHz PC. Tying time to
 // steps keeps runs deterministic.
 export const STEPS_PER_MILLISECOND = 50;
+// The BIOS keyboard buffer at 0040:001Eh holds 16 words, of which 15 can be in use.
+const BIOS_KEY_BUFFER = 15;
 const TIME_COUNTER = 0x188; // TIME's double millisecond counter: high cell at 188h, low cell at 18Ah
 
 export class ForthBootRunner {
@@ -236,6 +243,8 @@ export class ForthBootRunner {
   private keyQueue: number[] = [];
   // The machine state of the current run, kept between advance() calls.
   private session?: BootSession;
+  // Headerless colon words decoded during this run, by `${module}:${cfa}`; see inferColon().
+  private readonly inferredColons = new Map<string, ForthWord>();
   // `${module}:${cfa}` of words whose calls pause advance(); see setBreakpoint().
   private readonly breakpoints = new Set<string>();
   // EGA planes and registers; A000h memory goes through them while a graphics mode is set.
@@ -380,14 +389,25 @@ export class ForthBootRunner {
   }
 
   // `keys` are BIOS keyboard words typed ahead, in order; see biosKey().
-  // Run from `entryCfa` until it returns, stops, waits for a key with `keys` used up, or reaches `maxSteps`.
-  // `keys` are BIOS keyboard words typed ahead, in order; see biosKey().
-  run(entryCfa = 0x0937, maxSteps = 5_000_000, keys: readonly number[] = []): ForthBootResult {
+  // Run from `entryCfa` until it returns, stops, waits for a key with all keys used up, or reaches `maxSteps`.
+  // `keys` are BIOS keyboard words typed ahead, in order; see biosKey(). Each of `timedKeys` is pressed once the run
+  // reaches its step, or earlier if the run is already waiting in (KEY) for it.
+  run(entryCfa = 0x0937, maxSteps = 5_000_000, keys: readonly number[] = [], timedKeys: readonly TimedKey[] = []): ForthBootResult {
     this.start(entryCfa, keys);
-    let state = this.advance(maxSteps);
-    while (state === 'break') state = this.advance(maxSteps - this.session!.steps);
-    if (state === 'running') this.stop(`Stopped after the ${maxSteps}-step safety limit.`);
-    else if (state === 'waiting') this.stop('Waiting for a key at (KEY); the keyboard queue is empty.', true);
+    const pending = [...timedKeys].sort((first, second) => first.step - second.step);
+    let state: BootState = 'running';
+    while (state !== 'stopped' && this.session!.steps < maxSteps) {
+      const next = pending[0];
+      if (next && (next.step <= this.session!.steps || state === 'waiting')) {
+        this.pressKey(pending.shift()!.key);
+        state = 'running';
+        continue;
+      }
+      if (state === 'waiting') break;
+      state = this.advance(Math.min(maxSteps, next?.step ?? maxSteps) - this.session!.steps);
+    }
+    if (state === 'waiting') this.stop('Waiting for a key at (KEY); the keyboard queue is empty.', true);
+    else if (state !== 'stopped') this.stop(`Stopped after the ${maxSteps}-step safety limit.`);
     return this.snapshot();
   }
 
@@ -399,6 +419,7 @@ export class ForthBootRunner {
     this.dtaSegment = 0;
     this.dtaOffset = 0;
     this.keyQueue = [...keys];
+    this.inferredColons.clear();
     this.ega = new EgaAdapter();
     this.speakerPort = 0;
     this.speakerDivisor = 0;
@@ -433,8 +454,16 @@ export class ForthBootRunner {
   }
 
   // Type a key into the running machine; a run waiting in (KEY) continues on its next advance().
-  pressKey(key: number): void {
+  // Like the BIOS keyboard buffer, at most 15 keys wait; returns false when the key is dropped because it is full.
+  pressKey(key: number): boolean {
+    if (this.keyQueue.length >= BIOS_KEY_BUFFER) return false;
     this.keyQueue.push(key & 0xffff);
+    return true;
+  }
+
+  // Keys typed but not yet read by the game.
+  get pendingKeys(): number {
+    return this.keyQueue.length;
   }
 
   // The current result: trace, screens, and why the run stopped (empty while it is still running).
@@ -521,7 +550,7 @@ export class ForthBootRunner {
           continue;
         }
 
-        if (token.kind === 'exit' || token.cfa === CFA_EXIT1 || token.cfa === CFA_EXIT2) {
+        if (token.kind === 'exit' || token.cfa === CFA_EXIT1) {
           frames.pop();
           let note = 'return';
           if (frame.returnAddress !== undefined) {
@@ -778,6 +807,13 @@ export class ForthBootRunner {
             stopReason = `${target.name} target PFA 0x${executionPfa.toString(16)} resolves to unindexed CFA 0x${executionCfa.toString(16)} (code pointer 0x${codep.toString(16)}).`;
             break;
           }
+          const executionDoesBody = executionTarget.codep !== CODE_CALL ? this.decodeDoesBody(executionTarget) : undefined;
+          if (executionDoesBody) {
+            push(dataStack, executionTarget.pfa);
+            enter(executionDoesBody, frame, token);
+            trace.push(this.formatTrace(steps, frame.word, token, dataStack, `${executionLabel} DOES> ${executionTarget.name}@${executionTarget.module}`));
+            continue;
+          }
           if (executionTarget.type === 'constant') {
             push(dataStack, readWord(executionTarget.pfa));
           } else if (executionTarget.type === 'variable') {
@@ -848,10 +884,12 @@ export class ForthBootRunner {
   private inferWord(cfa: number, module = 'KERNEL', name = `W_0x${cfa.toString(16).padStart(4, '0')}`): ForthWord | undefined {
     const codep = this.memory[cfa & 0xffff] | (this.memory[(cfa + 1) & 0xffff] << 8);
     const pfa = (cfa + 2) & 0xffff;
+    if (codep === CODE_CALL) return this.inferColon(cfa, module, name);
     const type = codep === CODE_CONSTANT ? 'constant' : codep === CODE_VARIABLE ? 'variable' : codep === CODE_USER ? 'user' : undefined;
     const kind = type ? `${type} inferred from code field`
       : codep === 0x3672 ? 'OFFSET primitive inferred from code field'
       : codep === pfa ? 'headerless CODE inferred from code field'
+      : this.callsDoDoes(codep) ? 'headerless DOES> word inferred from code field' // e.g. CHKFLIGHT-OV's field [. at F1B9h
       : undefined;
     if (!kind) return undefined;
     return {
@@ -1183,6 +1221,37 @@ export class ForthBootRunner {
         this.outcodeVertices(readWord, writeWord);
         return { supported: true, note: `box outcodes: TRJCT ${readWord(0x56e8)} TACCPT ${readWord(0x56dc)}`, output };
       }
+      case 0x903f: { // LLINE ( x1 y1 x2 y2 -- ): far call to the EGA driver's line routine at REMSEG:0815h
+        const values = [0, 1, 2, 3].map(() => pop(dataStack, 'data'));
+        this.drawLine(readWord, writeWord, values);
+        return { supported: true, note: `line ${values[1]},${values[0]} to ${values[3]},${values[2]} color ${this.memory[0x55f2]}`, output };
+      }
+      case 0x906b: { // LCOPYBLK ( x1 y2 x2 y1 dx dy2 -- ): far call to the EGA driver's block copy at REMSEG:09DCh
+        const [destinationY, destinationX, lowY, right, highY, left] = [0, 1, 2, 3, 4, 5].map(() => pop(dataStack, 'data'));
+        let rows = (highY - lowY) & 0xffff; // 0988h: rows go towards the destination, so overlapping blocks copy safely
+        let step = 0xffff, sourceY = highY, targetY = destinationY;
+        if (toSignedCell((highY - destinationY) & 0xffff) >= 0) {
+          step = 1;
+          sourceY = (highY - rows) & 0xffff;
+          targetY = (destinationY - rows) & 0xffff;
+        }
+        rows = (rows + 1) & 0xffff || 0x10000;
+        const width = ((((right - left) & 0xffff) >>> 2) + 1) & 0xffff;
+        const segment = readWord(0x5648); // BUF-SEG
+        const yTable = readWord(0x563a); // YTABL
+        for (let row = 0; row < rows; row++) { // 0939h addresses, 0903h copy
+          const source = (readWord(yTable + sourceY * 2) + (left >>> 2)) & 0xffff;
+          const target = (readWord(yTable + targetY * 2) + (destinationX >>> 2)) & 0xffff;
+          sourceY = (sourceY + step) & 0xffff;
+          targetY = (targetY + step) & 0xffff;
+          if (toSignedCell(target) > toSignedCell(source)) { // STD: copy from the row's end, like the driver
+            this.latchCopyBackward(segment, (source + width - 1) & 0xffff, (target + width - 1) & 0xffff, width);
+          } else {
+            this.latchCopy(segment, source, segment, target, width);
+          }
+        }
+        return { supported: true, note: `EGA block copy x ${left}-${right} y ${lowY}-${highY} to ${destinationX},${destinationY}`, output };
+      }
       case 0x902b: // {BLT}: far call to the EGA driver's bitmap blit at REMSEG:064Fh
         this.blitBitmap(readWord, writeWord, readFarWord);
         return { supported: true, note: `bitmap blit ${readWord(0x5892)}x${readWord(0x5887)} at ${readWord(0x586e)},${readWord(0x5863)} color ${this.memory[0x55f2]}${readWord(0x587c) ? ' (XOR)' : ''}`, output };
@@ -1286,6 +1355,78 @@ export class ForthBootRunner {
         push(dataStack, ega);
         return { supported: true, note: `CGA color ${color} -> EGA ${ega}`, output };
       }
+      case 0x0c60: { // C!_2 and <C!> ( char addr -- )
+        const address = pop(dataStack, 'data');
+        this.memory[address & 0xffff] = pop(dataStack, 'data') & 0xff;
+        return { supported: true, note: 'write byte', output };
+      }
+      case 0x49ae: { // 1.5!_2 and <1.5!> ( lo hi addr -- ): a cell at addr and a byte at addr+2
+        const address = pop(dataStack, 'data');
+        this.memory[(address + 2) & 0xffff] = pop(dataStack, 'data') & 0xff;
+        writeWord(address, pop(dataStack, 'data'));
+        return { supported: true, note: 'write 1.5 cells', output };
+      }
+      case 0x4997: { // 1.5@ ( addr -- lo hi ): the cell at addr and the byte at addr+2
+        const address = pop(dataStack, 'data');
+        push(dataStack, readWord(address));
+        push(dataStack, this.memory[(address + 2) & 0xffff]);
+        return { supported: true, note: 'read 1.5 cells', output };
+      }
+      // The context stack: 3-byte entries (a cell, then a byte) growing down from CXSP (54B0h).
+      case 0x753f: { // >C ( lo hi -- ): store at CXSP, then move CXSP down 3
+        const pointer = readWord(0x54b0);
+        this.memory[(pointer + 2) & 0xffff] = pop(dataStack, 'data') & 0xff;
+        writeWord(pointer, pop(dataStack, 'data'));
+        writeWord(0x54b0, pointer - 3);
+        return { supported: true, note: `push to context stack at 0x${pointer.toString(16)}`, output };
+      }
+      case 0x755a: { // C> ( -- lo hi ): move CXSP up 3, then fetch from it
+        const pointer = (readWord(0x54b0) + 3) & 0xffff;
+        writeWord(0x54b0, pointer);
+        push(dataStack, readWord(pointer));
+        push(dataStack, this.memory[(pointer + 2) & 0xffff]);
+        return { supported: true, note: `pop from context stack at 0x${pointer.toString(16)}`, output };
+      }
+      case 0x7577: { // CI ( -- lo hi ): the top context-stack entry, left in place
+        const pointer = (readWord(0x54b0) + 3) & 0xffff;
+        push(dataStack, readWord(pointer));
+        push(dataStack, this.memory[(pointer + 2) & 0xffff]);
+        return { supported: true, note: `context stack top at 0x${pointer.toString(16)}`, output };
+      }
+      case 0x7425: { // IFLDADR ( pfa -- addr ): the field at offset [pfa+1] of the current instance record at 63EFh
+        const field = pop(dataStack, 'data');
+        const address = (this.memory[(field + 1) & 0xffff] + 0x63ef) & 0xffff;
+        push(dataStack, address);
+        return { supported: true, note: `instance field at 0x${address.toString(16)}`, output };
+      }
+      case 0x763a: // @[IOFF] ( -- n ): the cell in [IOFF]
+        push(dataStack, readWord(0x558c));
+        return { supported: true, note: 'read [IOFF]', output };
+      case 0x7684: { // PRIORIT ( offset -- offset' ): move an instance-cache hit one slot toward the front
+        const offset = pop(dataStack, 'data');
+        if (offset === 0) {
+          push(dataStack, 0);
+          return { supported: true, note: 'instance cache hit already first', output };
+        }
+        const previous = (offset - 2) & 0xffff;
+        for (const table of [readWord(0x54ea), readWord(0x54f2)]) { // LOISEG, LOCSEC: word entries
+          const hit = readFarWord(table, offset);
+          writeFarWord(table, offset, readFarWord(table, previous));
+          writeFarWord(table, previous, hit);
+        }
+        const bytes = readWord(0x54ee); // HIISEG: byte entries at half the offset
+        const base = bytes << 4;
+        const hitByte = this.readPhysicalByte(base + (offset >>> 1));
+        this.writePhysicalByte(base + (offset >>> 1), this.readPhysicalByte(base + (previous >>> 1)));
+        this.writePhysicalByte(base + (previous >>> 1), hitByte);
+        push(dataStack, previous);
+        return { supported: true, note: `advance instance cache entry 0x${offset.toString(16)}`, output };
+      }
+      case 0x75d7: { // CDEPTH ( -- n ): (6398h - CXSP) / 3 by an 8-bit DIV: quotient in AL, remainder in AH
+        const used = (0x6398 - readWord(0x54b0)) & 0xffff;
+        push(dataStack, ((used % 3) << 8) | (Math.floor(used / 3) & 0xff));
+        return { supported: true, note: `context stack depth ${Math.floor(used / 3)}`, output };
+      }
       case 0x7ae7: { // >V ( n -- ): store at VSP, then move VSP down a cell
         const pointer = readWord(0x54b4); // VSP
         writeWord(pointer, pop(dataStack, 'data'));
@@ -1317,6 +1458,11 @@ export class ForthBootRunner {
       case 0x2653: // BEEPOFF: clear the timer gate and speaker bits of port 61h
         this.speakerPort &= ~0x03;
         return { supported: true, note: 'PC speaker off (port 61h bits 0-1 cleared)', output };
+      case 0x7b15: { // VI ( -- n ): the top of the V stack (VSP + 2), left in place
+        const pointer = (readWord(0x54b4) + 2) & 0xffff;
+        push(dataStack, readWord(pointer));
+        return { supported: true, note: `V stack top at 0x${pointer.toString(16)}`, output };
+      }
       case 0x8d09: { // DISPLAY-WAIT: poll the CRT status port for the end of a retrace; no beam timing is emulated
         const port = readWord(0x584a) === 4 ? 0x3ba : 0x3da; // MONITOR = 4 is Hercules
         const bit = this.memory[EGA_FLAG] !== 0 ? 'vertical retrace' : 'display enable';
@@ -1354,6 +1500,12 @@ export class ForthBootRunner {
         push(dataStack, address % BLOCK_SIZE);
         push(dataStack, Math.floor(address / BLOCK_SIZE));
         return { supported: true, note: 'virtual address to block offset and block', output };
+      }
+      case 0x7295: { // BVSA>OFFBLK ( vsa -- offset block ): paragraphs above 3E80h, 64 per 1,024-byte block
+        const paragraphs = (pop(dataStack, 'data') - 0x3e80) & 0xffff;
+        push(dataStack, (paragraphs & 0x3f) << 4);
+        push(dataStack, paragraphs >>> 6);
+        return { supported: true, note: 'VSA to block offset and block', output };
       }
       case 0x71dd: { // DOFFBLK ( index -- entry-offset block ): 48 directory entries of 21 bytes per block
         let index = toSignedCell(pop(dataStack, 'data'));
@@ -1443,11 +1595,9 @@ export class ForthBootRunner {
       case 'C@':
         push(dataStack, this.memory[pop(dataStack, 'data') & 0xffff]);
         return { supported: true, note: 'read byte', output };
-      case 'C!_2': {
-        const address = pop(dataStack, 'data');
-        this.memory[address & 0xffff] = pop(dataStack, 'data') & 0xff;
-        return { supported: true, note: 'write byte', output };
-      }
+      case '+-@': // ( addr -- n ): fetch a byte and sign-extend it (CBW)
+        push(dataStack, (this.memory[pop(dataStack, 'data') & 0xffff] << 24) >> 24);
+        return { supported: true, note: 'read signed byte', output };
       case '?UPDATE': {
         const address = pop(dataStack, 'data');
         const signedAddress = toSignedCell(address);
@@ -1550,12 +1700,24 @@ export class ForthBootRunner {
           return Math.trunc(dividend / divisor);
         });
         return { supported: true, note: 'signed divide', output };
+      case '/MOD': { // POP BX; POP AX; CWD; IDIV BX; PUSH DX; PUSH AX: truncating, remainder takes the dividend's sign
+        const divisor = toSignedCell(pop(dataStack, 'data'));
+        const dividend = toSignedCell(pop(dataStack, 'data'));
+        const quotient = divisor === 0 ? NaN : Math.trunc(dividend / divisor);
+        if (!(quotient >= -0x8000 && quotient <= 0x7fff)) throw new RangeError('Forth /MOD divide overflow (INT 0)');
+        push(dataStack, dividend % divisor);
+        push(dataStack, quotient);
+        return { supported: true, note: 'signed divide with remainder', output };
+      }
       case '0=':
         unary(value => value === 0 ? 1 : 0);
         return { supported: true, note: 'zero test', output };
       case '0<':
         unary(value => toSignedCell(value) < 0 ? 1 : 0);
         return { supported: true, note: 'signed negative test', output };
+      case '0>': // NEG AX; CWD; NEG DX: 1 when -n is negative, so also for 8000h, which negates to itself
+        unary(value => toSignedCell(-value & 0xffff) < 0 ? 1 : 0);
+        return { supported: true, note: 'signed positive test', output };
       case '=':
         binary((left, right) => left === right ? 1 : 0);
         return { supported: true, note: 'equality test', output };
@@ -1782,6 +1944,12 @@ export class ForthBootRunner {
         push(dataStack, Math.floor(product / 0x10000));
         return { supported: true, note: 'unsigned multiply to double', output };
       }
+      case 'S->D': { // MOV AX,[SP]; CWD; PUSH DX: keep n, push its sign as the high cell
+        const value = pop(dataStack, 'data');
+        push(dataStack, value);
+        push(dataStack, value & 0x8000 ? 0xffff : 0);
+        return { supported: true, note: 'sign-extend to double', output };
+      }
       case 'D+': {
         const high2 = pop(dataStack, 'data');
         const low2 = pop(dataStack, 'data');
@@ -1850,28 +2018,59 @@ export class ForthBootRunner {
     return frame.word.tokens[frame.tokenIndex]?.addr ?? ((token.addr + 2) & 0xffff);
   }
 
+  // A headerless colon definition (e.g. ASSCREW-OV's word at EAC2h), decoded from runtime memory once per run.
+  private inferColon(cfa: number, module: string, name: string): ForthWord | undefined {
+    const key = `${module}:${cfa}`;
+    const cached = this.inferredColons.get(key);
+    if (cached) return cached;
+    const pfa = (cfa + 2) & 0xffff;
+    const tokens = this.decodeThreaded(pfa, module);
+    if (!tokens) return undefined;
+    const hex = (value: number) => `0x${value.toString(16).padStart(4, '0')}`;
+    const word: ForthWord = {
+      name, cfa, cfaHex: hex(cfa), pfa, pfaHex: hex(pfa), codep: CODE_CALL, codepHex: hex(CODE_CALL), module,
+      type: 'colon', typeLabel: 'headerless colon definition decoded from memory',
+      decompiled: `: ${name} ${tokens.map(token => token.name).join(' ')}`, tokens,
+      rawBytes: this.memory.subarray(cfa, Math.min(cfa + 32, this.memory.length))
+    };
+    this.inferredColons.set(key, word);
+    return word;
+  }
+
+  // A DOES> child's code field points at `call DODOES`.
+  private callsDoDoes(codep: number): boolean {
+    const offset = this.memory[(codep + 1) & 0xffff] | (this.memory[(codep + 2) & 0xffff] << 8);
+    return this.memory[codep & 0xffff] === 0xe8 && ((codep + 3 + offset) & 0xffff) === CODE_DODOES;
+  }
+
   // A DOES> code field starts with `call DODOES`; the threaded body follows the call.
   private decodeDoesBody(word: ForthWord): ForthWord | undefined {
-    const readWord = (address: number) => this.memory[address & 0xffff] | (this.memory[(address + 1) & 0xffff] << 8);
-    if (this.memory[word.codep] !== 0xe8 || ((word.codep + 3 + readWord(word.codep + 1)) & 0xffff) !== CODE_DODOES) {
-      return undefined;
-    }
+    if (!this.callsDoDoes(word.codep)) return undefined;
+    const body = (word.codep + 3) & 0xffff;
+    const tokens = this.decodeThreaded(body, 'KERNEL');
+    if (!tokens) return undefined;
+    return { ...word, name: `DOES> ${word.name}`, type: 'colon', typeLabel: `DOES> body at 0x${body.toString(16)}`, tokens };
+  }
 
+  // Decode threaded code from runtime memory up to the first EXIT, like the decompiler: literals, double literals,
+  // branches, inline strings, and calls. Calls are named from the dictionary when possible and otherwise resolved
+  // when they run. Returns undefined when no EXIT turns up within `maxBytes`.
+  private decodeThreaded(start: number, module: string, maxBytes = 1024): ForthToken[] | undefined {
+    const readWord = (address: number) => this.memory[address & 0xffff] | (this.memory[(address + 1) & 0xffff] << 8);
+    const hex = (value: number) => `0x${value.toString(16).padStart(4, '0')}`;
     const tokens: ForthToken[] = [];
-    let address = (word.codep + 3) & 0xffff;
-    while (tokens.length < 64) {
+    let address = start & 0xffff;
+    // An EXIT before the furthest forward branch target is an early exit (`IF ... EXIT THEN`); keep decoding.
+    let furthestTarget = 0;
+    while (((address - start) & 0xffff) < maxBytes) {
       const cfa = readWord(address);
-      const addrHex = `0x${address.toString(16).padStart(4, '0')}`;
-      const cfaHex = `0x${cfa.toString(16).padStart(4, '0')}`;
-      if (cfa === CFA_EXIT1 || cfa === CFA_EXIT2) {
+      const addrHex = hex(address);
+      const cfaHex = hex(cfa);
+      if (cfa === CFA_EXIT1) {
         tokens.push({ addr: address, addrHex, cfa, cfaHex, name: ';', kind: 'exit' });
-        return {
-          ...word,
-          name: `DOES> ${word.name}`,
-          type: 'colon',
-          typeLabel: `DOES> body at 0x${((word.codep + 3) & 0xffff).toString(16)}`,
-          tokens
-        };
+        if (furthestTarget <= address) return tokens;
+        address = (address + 2) & 0xffff;
+        continue;
       }
       if (cfa === CFA_LIT) {
         const value = readWord(address + 2);
@@ -1885,14 +2084,30 @@ export class ForthBootRunner {
         const double = `${(high << 16) | low}.`;
         tokens.push({ addr: address, addrHex, cfa, cfaHex, name: `${double} (low)`, kind: 'lit', arg: low });
         const highAddress = (address + 2) & 0xffff;
-        tokens.push({ addr: highAddress, addrHex: `0x${highAddress.toString(16).padStart(4, '0')}`, cfa, cfaHex, name: `${double} (high)`, kind: 'lit', arg: high });
+        tokens.push({ addr: highAddress, addrHex: hex(highAddress), cfa, cfaHex, name: `${double} (high)`, kind: 'lit', arg: high });
         address = (address + 6) & 0xffff;
         continue;
       }
-      // Bodies may reference headerless words, e.g. the color DOES> words' table variable at 0x4edb.
-      const target = this.engine.wordsByCfa.get(cfa)?.find(candidate => candidate.module === 'KERNEL') ?? this.inferWord(cfa);
-      if (!target || cfa === CFA_0BRANCH || cfa === CFA_BRANCH) return undefined;
-      tokens.push({ addr: address, addrHex, cfa, cfaHex, name: target.name, kind: 'call' });
+      if (cfa === CFA_0BRANCH || cfa === CFA_BRANCH) {
+        // The offset cell follows, relative to its own address (e.g. <ON> and <OFF> at 3AECh).
+        const target = (address + 2 + toSignedCell(readWord(address + 2))) & 0xffff;
+        furthestTarget = Math.max(furthestTarget, target);
+        const name = `${cfa === CFA_0BRANCH ? 'IF' : 'ELSE'} [-> 0x${target.toString(16)}]`;
+        tokens.push({ addr: address, addrHex, cfa, cfaHex, name, kind: 'branch', arg: target });
+        address = (address + 4) & 0xffff;
+        continue;
+      }
+      const known = this.engine.wordsByCfa.get(cfa)?.find(candidate => candidate.module === module || candidate.module === 'KERNEL');
+      const name = known?.name ?? `W_${cfaHex}`;
+      if (name === '(.")' || name === '(ABORT")' || name === 'SET_STR_AS_PARAM') {
+        // A counted string follows the call.
+        const length = this.memory[(address + 2) & 0xffff];
+        const text = Array.from({ length }, (_, index) => String.fromCharCode(this.memory[(address + 3 + index) & 0xffff])).join('');
+        tokens.push({ addr: address, addrHex, cfa, cfaHex, name: `${name} "${text}"`, kind: 'call' });
+        address = (address + 3 + length) & 0xffff;
+        continue;
+      }
+      tokens.push({ addr: address, addrHex, cfa, cfaHex, name, kind: 'call' });
       address = (address + 2) & 0xffff;
     }
     return undefined;
@@ -1928,6 +2143,74 @@ export class ForthBootRunner {
     for (let x = start; x <= end; x++) this.plotEga(x, y);
   }
 
+  // LLINE (far call to the EGA driver at REMSEG:0815h) ( x1 y1 x2 y2 -- ): a Bresenham line from (x2, y2) to (x1, y1)
+  // in COLOR, with 8-bit coordinates and no clipping. Like SCANPOLY's edge walk, the driver patches its loop (step
+  // opcodes and deltas at 08D1h-08E1h) and uses half the minor delta as the error threshold.
+  private drawLine(readWord: (address: number) => number, writeWord: (address: number, value: number) => void, values: number[]): void {
+    // Popped y2 first: the driver's Y1/X1 (the start) get y2/x2, and Y2/X2 (the end) get y1/x1.
+    const [startY, startX, endY, endX] = values;
+    writeWord(0x5613, startY); // Y1
+    writeWord(0x561c, startX); // X1
+    writeWord(0x5625, endY); // Y2
+    writeWord(0x562e, endX); // X2
+    this.ega.out(0x3ce, 1); // Enable Set/Reset on all planes
+    this.ega.out(0x3cf, 0x0f);
+    const INC_BL = 0xc3, DEC_BL = 0xcb, INC_BH = 0xc7, DEC_BH = 0xcf; // ModRM bytes of inc/dec bl/bh
+    let xStep = INC_BL;
+    let minor = (endX - startX) & 0xffff;
+    if (toSignedCell(minor) < 0) {
+      xStep = DEC_BL;
+      minor = -minor & 0xffff;
+    }
+    let yStep = INC_BH;
+    let major = (endY - startY) & 0xffff;
+    if (toSignedCell(major) < 0) {
+      yStep = DEC_BH;
+      major = -major & 0xffff;
+    }
+    let majorStep = yStep;
+    let minorStep = xStep;
+    if (toSignedCell(major) < toSignedCell(minor)) {
+      [major, minor] = [minor, major];
+      [majorStep, minorStep] = [minorStep, majorStep];
+    }
+    const threshold = minor >>> 1;
+    const driver = readWord(0x52a5) << 4; // REMSEG
+    this.writePhysicalByte(driver + 0x8d1, majorStep);
+    this.writePhysicalByte(driver + 0x8d4, minor);
+    this.writePhysicalByte(driver + 0x8d5, minor >>> 8);
+    this.writePhysicalByte(driver + 0x8d8, threshold);
+    this.writePhysicalByte(driver + 0x8d9, threshold >>> 8);
+    this.writePhysicalByte(driver + 0x8de, major);
+    this.writePhysicalByte(driver + 0x8df, major >>> 8);
+    this.writePhysicalByte(driver + 0x8e1, minorStep);
+
+    let x = startX & 0xff; // bl
+    let y = startY & 0xff; // bh
+    const step = (opcode: number) => {
+      if (opcode === INC_BL) x = (x + 1) & 0xff;
+      else if (opcode === DEC_BL) x = (x - 1) & 0xff;
+      else if (opcode === INC_BH) y = (y + 1) & 0xff;
+      else y = (y - 1) & 0xff;
+    };
+    this.ega.out(0x3ce, 0); // Set/Reset = COLOR
+    this.ega.out(0x3cf, this.memory[0x55f2]);
+    let error = 0;
+    let remaining = major;
+    do {
+      this.plotEga(x, y);
+      step(majorStep);
+      error = (error + minor) & 0xffff;
+      if (toSignedCell(error) > toSignedCell(threshold)) {
+        error = (error - major) & 0xffff;
+        step(minorStep);
+      }
+      remaining = (remaining - 1) & 0xffff;
+    } while (toSignedCell(remaining) >= 0);
+    this.ega.out(0x3ce, 8); // Bit Mask FFh
+    this.ega.out(0x3cf, 0xff);
+  }
+
   // 8E32h: copy `count` bytes in write mode 1. Each read loads all four latches and each write stores them, so the
   // rep movsb copies every plane.
   private latchCopy(sourceSegment: number, sourceOffset: number, destinationSegment: number, destinationOffset: number, count: number): void {
@@ -1936,6 +2219,18 @@ export class ForthBootRunner {
     for (let index = 0; index < count; index++) {
       const value = this.readPhysicalByte((sourceSegment << 4) + ((sourceOffset + index) & 0xffff));
       this.writePhysicalByte((destinationSegment << 4) + ((destinationOffset + index) & 0xffff), value);
+    }
+    this.ega.out(0x3ce, 5);
+    this.ega.out(0x3cf, 0);
+  }
+
+  // latchCopy with the direction flag set: from the given last bytes down, as the driver's STD; REP MOVSB.
+  private latchCopyBackward(segment: number, sourceEnd: number, destinationEnd: number, count: number): void {
+    this.ega.out(0x3ce, 5);
+    this.ega.out(0x3cf, 1);
+    for (let index = 0; index < count; index++) {
+      const value = this.readPhysicalByte((segment << 4) + ((sourceEnd - index) & 0xffff));
+      this.writePhysicalByte((segment << 4) + ((destinationEnd - index) & 0xffff), value);
     }
     this.ega.out(0x3ce, 5);
     this.ega.out(0x3cf, 0);

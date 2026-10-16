@@ -1,16 +1,68 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
+import { readFile } from 'node:fs/promises';
 import { ForthBootRunner, STEPS_PER_MILLISECOND, biosKey, screenLines } from '../src/forth-boot.ts';
-import { CODE_CALL, CFA_EXIT1, ForthEngine, type ForthToken, type ForthWord } from '../src/forth-decompiler.ts';
+import { CODE_CALL, CFA_EXIT1, ForthEngine, createForthEngine, type ForthToken, type ForthWord } from '../src/forth-decompiler.ts';
 import { BLOCK_SIZE } from '../src/starflight-fs.ts';
 import { EgaAdapter } from '../src/ega.ts';
 
 type Operation = number | string;
 
-const CODE_POINTERS: Record<string, number> = { 'LC@': 0x2ecd, 'C!': 0x0c60 };
+let nativeFixture: Promise<{ engine: ForthEngine; image: Uint8Array; disks: { stara: Uint8Array; starb: Uint8Array }; checkpoint: ReturnType<ForthBootRunner['saveState']> }> | undefined;
+
+function realNativeFixture() {
+  return nativeFixture ??= (async () => {
+    const [stara, starb, image, dictionary] = await Promise.all([
+      readFile(new URL('../public/STARA.COM', import.meta.url)).then(bytes => Uint8Array.from(bytes)),
+      readFile(new URL('../public/STARB.COM', import.meta.url)).then(bytes => Uint8Array.from(bytes)),
+      readFile(new URL('../public/STARFLT.COM', import.meta.url)).then(bytes => Uint8Array.from(bytes)),
+      readFile(new URL('../public/forth-dict.json', import.meta.url), 'utf8')
+    ]);
+    const engine = await createForthEngine(stara.buffer, starb.buffer, image.buffer, JSON.parse(dictionary));
+    const disks = { stara, starb };
+    const runner = new ForthBootRunner(engine, image, disks);
+    runner.start(0x0937, [biosKey('5')!, biosKey('Enter')!]);
+    runner.advance(200_000);
+    const checkpoint = runner.saveState();
+    return { engine, image, disks, checkpoint };
+  })();
+}
+
+async function runRealNative(operations: (number | ForthWord)[], setup?: (state: ReturnType<ForthBootRunner['saveState']>) => void) {
+  const fixture = await realNativeFixture();
+  const runner = new ForthBootRunner(fixture.engine, fixture.image, fixture.disks);
+  const checkpoint = structuredClone(fixture.checkpoint);
+  const tokens: ForthToken[] = operations.map((operation, index) => ({
+    addr: 0x1000 + index * 4, addrHex: `0x${(0x1000 + index * 4).toString(16)}`,
+    cfa: typeof operation === 'number' ? 0 : operation.cfa,
+    cfaHex: typeof operation === 'number' ? '0x0000' : operation.cfaHex,
+    name: typeof operation === 'number' ? String(operation) : operation.name,
+    kind: typeof operation === 'number' ? 'lit' : 'call', arg: typeof operation === 'number' ? operation : undefined
+  }));
+  tokens.push({ addr: 0x1000 + operations.length * 4, addrHex: '0x0000', cfa: CFA_EXIT1, cfaHex: '0x1690', name: ';', kind: 'exit' });
+  checkpoint.session.frames = [{ word: word('NATIVE-TEST', 0x0937, CODE_CALL, tokens), tokenIndex: 0 }];
+  checkpoint.session.returnStack = [];
+  checkpoint.session.stackPointer = new DataView(checkpoint.physicalMemory.buffer).getUint16((0x0192 << 4) + 0x078c, true);
+  checkpoint.session.state = 'running';
+  checkpoint.session.stopReason = '';
+  checkpoint.session.trace = [];
+  checkpoint.breakpoints = [];
+  for (const operation of operations) {
+    if (typeof operation === 'number' || operation.module === 'KERNEL') continue;
+    const overlay = fixture.engine.overlays.get(operation.module)!;
+    checkpoint.physicalMemory.set(overlay.memory.subarray(overlay.storeofs, overlay.storeofs + overlay.size), (0x0192 << 4) + overlay.storeofs);
+    new DataView(checkpoint.physicalMemory.buffer).setUint16((0x0192 << 4) + 0x55a5, overlay.vsa, true);
+  }
+  setup?.(checkpoint);
+  runner.loadState(checkpoint);
+  runner.advance(10_000);
+  return { runner, result: runner.snapshot() };
+}
+
+const CODE_POINTERS: Record<string, number> = { 'LC@': 0x2ecd, 'C!': 0x0c60, RECADD: 0x718d, '+BIT': 0x4af3, '!IB': 0x9aba, '!IW': 0x9a9e, 'EASY-BITS': 0x4b17, 'D2*': 0x4b08, '?ILOCUS': 0x9d18, XCHGICON: 0x9e14, '?IID': 0x9eb1, '4*': 0x1047, '3+': 0x4984, TOGGLE: 0x1355, '@L': 0x0bbf, '!L': 0x0bf1 };
 
 function createRunner(operations: Operation[], stara: Uint8Array, starb: Uint8Array): ForthBootRunner {
-  const names = ['R/W', 'LC@', 'LC!', 'C@', 'C!'];
+  const names = Object.keys(CODE_POINTERS).concat(['R/W', 'LC!', 'C@']);
   const primitives: ForthWord[] = names.map((name, index) => ({
     name: name === 'C!' ? 'C!_2' : name,
     cfa: 0x200 + index * 2,
@@ -52,6 +104,749 @@ function createRunner(operations: Operation[], stara: Uint8Array, starb: Uint8Ar
 function transfer(segment: number, offset: number, block: number, reading = 1): Operation[] {
   return [segment, offset, block, reading, 'R/W'];
 }
+
+Object.assign(CODE_POINTERS, {
+  'C!L': 0x0c71, 'C@L': 0x0ca7, 'L+-@': 0x49f0, 'L1.5@': 0x4bd9,
+  'CMOVE>': 0x0ce4, '<LCMOVE': 0x48dc, 'V@': 0x29e1, VFILL: 0x2a18,
+  VMOVE: 0x2a36, 'VMOVE-': 0x2a5f, '2^N': 0x4910
+});
+Object.assign(CODE_POINTERS, { DIGIT: 0x14bd, '(SLIPPE': 0x4c87, '@IW': 0x9a6c, '?INVIS': 0x992d, 'WLD>SCR': 0x9970, 'SCR>BLT': 0x99b4, MATCH: 0x39ee });
+
+test('U/MOD follows the installed divide-error recovery handler for zero and overflow', async () => {
+  const { engine } = await realNativeFixture();
+  const divide = engine.get('U/MOD', 'KERNEL');
+  assert.ok(divide);
+  const cases = [
+    { operands: [0xffff, 0, 1], expected: [0, 0xffff] },
+    { operands: [0xffff, 1, 2], expected: [1, 0xffff] },
+    { operands: [0x1234, 0x5678, 0], expected: [0, 0] },
+    { operands: [0, 1, 1], expected: [0, 0] }
+  ];
+  for (const { operands, expected } of cases) {
+    const { result } = await runRealNative([0xbeef, ...operands, divide]);
+    assert.equal(result.stopReason, 'Forth returned from the entry word.', result.trace.join('\n'));
+    const stack = [0xbeef, ...expected].map(value => `0x${value.toString(16).padStart(4, '0')}`).join(' ');
+    assert.ok(result.trace.at(-2)!.endsWith(`[${stack}] return`), result.trace.join('\n'));
+  }
+  for (const handler of [0x01c4, 0x01c7, 0x01d1, 0]) {
+    const { result } = await runRealNative([0xbeef, 0, 0, 0, divide], checkpoint => {
+      const memory = new DataView(checkpoint.physicalMemory.buffer);
+      memory.setUint16(0, handler, true);
+      memory.setUint16(2, handler ? 0x0192 : 0, true);
+    });
+    assert.equal(result.stopReason, handler ? 'Forth returned from the entry word.' : 'Forth U/MOD division by zero');
+    if (handler) assert.match(result.trace.at(-2)!, /\[0xbeef 0x0000 0x0000\] return$/);
+  }
+});
+
+test('HYPER .AUXSHIP renders the orbital auxiliary map when its radius is zero', async () => {
+  const { engine } = await realNativeFixture();
+  const auxiliaryShip = engine.get('.AUXSHIP', 'HYPER-OV');
+  assert.ok(auxiliaryShip);
+  const { result } = await runRealNative([0xbeef, auxiliaryShip], checkpoint => {
+    const memory = new DataView(checkpoint.physicalMemory.buffer);
+    const poke = (address: number, value: number) => memory.setUint16((0x0192 << 4) + address, value, true);
+    for (const [address, value] of [[0x5a5c, 1], [0x5d81, 5], [0xd9dc, 0], [0x5dae, 0], [0x5db9, 0], [0x5648, 0xa000], [0x563a, 0x6000]]) poke(address, value);
+    for (let row = 0; row < 200; row++) poke(0x6000 + row * 2, row * 40);
+    checkpoint.ega.planes.forEach(plane => plane.fill(0));
+  });
+  assert.equal(result.stopReason, 'Forth returned from the entry word.', result.trace.join('\n'));
+  assert.match(result.trace.at(-2)!, /\[0xbeef\] return$/);
+  assert.equal(result.graphics!.pixels[161 * 320 + 120 * 2], 15);
+  assert.equal(result.trace.filter(line => line.includes('unsigned divide fault recovered')).length, 2);
+});
+
+test('SQRT returns integer distances for unsigned double-cell inputs', async () => {
+  const { engine } = await realNativeFixture();
+  const sqrt = engine.get('SQRT', 'KERNEL');
+  assert.ok(sqrt);
+  for (const value of [0, 1, 2, 3, 4, 9, 25, 144, 65535, 65536, 0x7fffffff, 0xffffffff]) {
+    const { result } = await runRealNative([0xbeef, value & 0xffff, value >>> 16, sqrt]);
+    assert.equal(result.stopReason, 'Forth returned from the entry word.', result.trace.join('\n'));
+    const expected = Math.floor(Math.sqrt(value));
+    assert.ok(result.trace.at(-2)!.endsWith(`[0xbeef 0x${expected.toString(16).padStart(4, '0')}] return`), `SQRT(${value})\n${result.trace.join('\n')}`);
+  }
+});
+
+test('*/ preserves a nonzero divisor through nested return-stack calls', async () => {
+  const { engine } = await realNativeFixture();
+  const multiplyDivide = engine.get('*/', 'KERNEL');
+  assert.ok(multiplyDivide);
+  for (const [left, right, divisor, expected] of [[4, 25, 10, 10], [0, 25, 10, 0], [0xfffc, 25, 10, 0xfff6]]) {
+    const { result } = await runRealNative([0xbeef, left, right, divisor, multiplyDivide]);
+    assert.equal(result.stopReason, 'Forth returned from the entry word.', result.trace.join('\n'));
+    assert.ok(result.trace.at(-2)!.endsWith(`[0xbeef 0x${expected.toString(16).padStart(4, '0')}] return`), result.trace.join('\n'));
+  }
+});
+
+test('native conversion and icon helpers use the configured tables and video word counts', () => {
+  const operations: Operation[] = [
+    65, 16, 'DIGIT', 71, 16, 'DIGIT',
+    0x34, 0x5a02, 'C!', 0x1234, 0x3000, '!IW', 0x3000, '@IW',
+    2, 0x5a4e, 'C!', 10, 20, 'SCR>BLT',
+    0, 0, '?INVIS', 1, 0, '?INVIS',
+    0, 0x07a4, 'C!', 0xb8, 0x07a5, 'C!',
+    0, 3, 0x0741, 'VFILL', 0, 'V@', 4, 6, 2, 'VMOVE-', 6, 'V@', 4, 'V@'
+  ];
+  const result = createRunner(operations, new Uint8Array(), new Uint8Array()).run();
+  assert.equal(result.stopReason, 'Forth returned from the entry word.');
+  assert.match(result.trace.at(-2)!, /0x1234 0x0008 0x0019 0x0001 0x0000 0x0041 0x0041 0x0041\] return$/);
+});
+
+test('native memory helpers copy overlapping ranges backward and fetch banked values', () => {
+  const result = createRunner([
+    0x1234, 0x8000, 3, '!L', 0x80, 0x8002, 3, 'C!L',
+    0x3000, 0x8000, 'L1.5@', 0x3000, 0x8002, 'L+-@',
+    0x8002, 3, 'C@L',
+    1, 0x6000, 'C!', 2, 0x6001, 'C!', 3, 0x6002, 'C!',
+    0x6000, 0x6001, 3, 'CMOVE>',
+    0x6001, 'C@', 0x6002, 'C@', 0x6003, 'C@',
+    15, '2^N', 16, '2^N', 17, '2^N', 0xffff, '2^N'
+  ], new Uint8Array(), new Uint8Array()).run();
+  assert.equal(result.stopReason, 'Forth returned from the entry word.');
+  assert.match(result.trace.at(-2)!, /0x0080 0x0001 0x0002 0x0003 0x8000 0x0000 0x0001 0x0000\] return$/);
+});
+
+test('native search helpers preserve byte matching, sliding masks and reverse color mapping', async () => {
+  const { engine } = await realNativeFixture();
+  const get = (name: string) => {
+    const target = engine.get(name, 'KERNEL');
+    assert.ok(target);
+    return target;
+  };
+  const { result } = await runRealNative([
+    0x7000, 5, 0x7100, 2, get('MATCH'),
+    100, get('(SLIPPE'), 101, get('(SLIPPE'), 500, get('(SLIPPE'),
+    9, get('E>CGA'), 0x17, get('E>CGA')
+  ], checkpoint => {
+    const base = 0x0192 << 4;
+    const memory = new DataView(checkpoint.physicalMemory.buffer);
+    memory.setUint16(base + 0x4c57, 100, true);
+    memory.setUint16(base + 0x4c4c, 1, true);
+    checkpoint.physicalMemory.fill(0, base + 0x4c5b, base + 0x4c5b + 32);
+    checkpoint.physicalMemory[base + 0x4c5b + 16] = 1;
+    checkpoint.physicalMemory.set([65, 66, 65, 66, 67], base + 0x7000);
+    checkpoint.physicalMemory.set([66, 67], base + 0x7100);
+    for (let index = 0; index < 16; index++) {
+      checkpoint.physicalMemory[base + 0x4fcd + index] = index;
+      checkpoint.physicalMemory[base + 0x4fbb + index] = 0x10 + index;
+    }
+  });
+  assert.equal(result.stopReason, 'Forth returned from the entry word.', result.trace.join('\n'));
+  assert.match(result.trace.at(-2)!, /\[0x0001 0x0004 0x0064 0x0001 0x0000 0x0000 0x0019 0x0017\] return$/);
+});
+
+test('compiler helpers redirect threads, GO dispatches translated entries, and arbitrary code stops explicitly', async () => {
+  const { engine } = await realNativeFixture();
+  const get = (name: string) => {
+    const target = engine.get(name, 'KERNEL');
+    assert.ok(target);
+    return target;
+  };
+  const operations = [0xbad, 0xbad, 0xbad, 0xbad, 0xbeef];
+  for (const name of ['(>CODE)', '(;VIA)']) {
+    const { result } = await runRealNative([get(name), ...operations], checkpoint => {
+      if (name === '(>CODE)') checkpoint.physicalMemory.set([0x0e, 0, 0xb8, 7, 0, 0x50, 0xad, 0x8b, 0xd8, 0xff, 0x27], (0x0192 << 4) + 0x1004);
+      else new DataView(checkpoint.physicalMemory.buffer).setUint16((0x0192 << 4) + 0x1004, 0x1012, true);
+    });
+    if (name === '(>CODE)') assert.equal(result.stopReason, '(>CODE) block at 0x1006 has no TypeScript translation.');
+    else {
+      assert.equal(result.stopReason, 'Forth returned from the entry word.', result.trace.join('\n'));
+      assert.match(result.trace.at(-2)!, /\[0xbeef\] return$/);
+    }
+  }
+  const jump = await runRealNative([0x7000, get('GO'), 0xbeef], checkpoint => {
+    checkpoint.physicalMemory.set([0xb8, 7, 0, 0x50, 0xad, 0x8b, 0xd8, 0xff, 0x27], (0x0192 << 4) + 0x7000);
+  });
+  assert.equal(jump.result.stopReason, 'GO target 0x7000 has no TypeScript translation.');
+  const translated = await runRealNative([0xbeef, 0x4984, get('GO')]);
+  assert.equal(translated.result.stopReason, 'Forth returned from the entry word.', translated.result.trace.join('\n'));
+  assert.match(translated.result.trace.at(-2)!, /\[0xbef2\] return$/);
+  const exit = await runRealNative([0, get('GO'), 0xbad]);
+  assert.equal(exit.result.stopReason, 'Forth returned from the entry word.', exit.result.trace.join('\n'));
+  const syscall = await runRealNative([0x0d, 0, get('SYSCALL'), get('PRTSCR'), get('XKEYINT')]);
+  assert.equal(syscall.result.stopReason, 'Forth returned from the entry word.', syscall.result.trace.join('\n'));
+  assert.ok(syscall.result.output.length > 0);
+});
+
+test('translated CLIPPER handles closed polygons, open lines and boundary vertices', async () => {
+  const { engine } = await realNativeFixture();
+  const clipper = engine.get('CLIPPER', 'KERNEL');
+  assert.ok(clipper);
+  const cases = [
+    { vertices: [-5, -5, -5, 15, 15, 15, 15, -5], open: 0, expected: ['0,0', '0,10', '10,0', '10,10'] },
+    { vertices: [-5, 0, -5, 10, 5, 10, 5, 0], open: 0, expected: ['0,0', '0,10', '5,0', '5,10'] },
+    { vertices: [-5, 5, 15, 5], open: 1, expected: ['0,5', '10,5'] },
+    { vertices: [1, 1, 1, 9, 9, 9, 9, 1], open: 0, expected: ['1,1', '1,9', '9,1', '9,9'] },
+    { vertices: [20, 20, 20, 30, 30, 30, 30, 20], open: 0, expected: [] }
+  ];
+  for (const { vertices, open, expected } of cases) {
+  const { runner, result } = await runRealNative([0xbeef, clipper], checkpoint => {
+    const memory = new DataView(checkpoint.physicalMemory.buffer);
+    const poke = (address: number, value: number) => memory.setUint16((0x0192 << 4) + address, value & 0xffff, true);
+    for (const [address, value] of [[0x569b, 0x7000], [0x56a6, 0x7100], [0x56b0, 0x7200], [0x56bb, 0x7300],
+      [0x5686, vertices.length / 2], [0x56f4, open], [0x5738, 0], [0x5745, 10], [0x5752, 0], [0x575f, 10]]) poke(address, value);
+    for (let side = 0; side < 4; side++) {
+      const mask = checkpoint.physicalMemory[(0x0192 << 4) + 0x5253 + side * 5];
+      poke(0x5253 + side * 5 + 3, mask & 0x0a ? 10 : 0);
+    }
+    vertices.forEach((value, index) => poke(0x7000 + index * 2, value));
+  });
+  assert.equal(result.stopReason, 'Forth returned from the entry word.', result.trace.join('\n'));
+  const memory = new DataView(runner.saveState().physicalMemory.buffer);
+  const base = 0x0192 << 4;
+  const count = memory.getUint16(base + 0x5686, true);
+  const vertex = memory.getUint16(base + 0x569b, true);
+  assert.equal(count, expected.length);
+  const corners = Array.from({ length: count }, (_, index) => [memory.getInt16(base + vertex + index * 4, true), memory.getInt16(base + vertex + index * 4 + 2, true)]);
+  assert.deepEqual(corners.map(corner => corner.join(',')).sort(), expected.toSorted());
+  }
+});
+
+test('native overlay routines scale bytes, configure blits, copy regions and decode CGA runs', async () => {
+  const { engine } = await realNativeFixture();
+  const get = (cfa: number, module: string) => {
+    const target = engine.get(cfa, module);
+    assert.ok(target, `${module}:${cfa.toString(16)}`);
+    return target;
+  };
+  const orbit = await runRealNative([0xbeef, 0xfff4, 4, 3, get(0xdf11, 'ORBIT-OV'), get(0xdf00, 'ORBIT-OV')]);
+  assert.equal(orbit.result.stopReason, 'Forth returned from the entry word.', orbit.result.trace.join('\n'));
+  assert.match(orbit.result.trace.at(-2)!, /\[0xbeef 0xfff0\] return$/);
+  const orbitState = orbit.runner.saveState();
+  assert.equal(new DataView(orbitState.physicalMemory.buffer).getUint16((0x0192 << 4) + 0xdc20, true), orbitState.session.stackPointer);
+  for (const [module, cfa, bitmap] of [['MOVE-OV', 0xe8f1, 0xe8e5], ['MAPS-OV', 0xefd7, 0xefcb]] as const) {
+    const blit = await runRealNative([0xbeef, 10, 20, get(cfa, module)]);
+    assert.equal(blit.result.stopReason, 'Forth returned from the entry word.', blit.result.trace.join('\n'));
+    const memory = new DataView(blit.runner.saveState().physicalMemory.buffer);
+    for (const [address, value] of [[0x586e, 16], [0x5863, 23], [0x5892, 4], [0x5887, 6], [0x589d, bitmap], [0x58aa, 0x0192]]) {
+      assert.equal(memory.getUint16((0x0192 << 4) + address, true), value);
+    }
+  }
+  for (const [module, cfa] of [['SITE-OV', 0xf04e], ['PORTMENU-OV', 0xec0a]] as const) {
+    const region = await runRealNative([0xbeef, 0x4000, 0, get(cfa, module)], checkpoint => {
+      const memory = new DataView(checkpoint.physicalMemory.buffer);
+      for (const [address, value] of [[0x5648, 0x3000], [0x563a, 0x6000], [0x5892, 0], [0x586e, 4], [0x5863, 4], [0x5887, 2], [0x6006, 120], [0x6008, 160]]) {
+        memory.setUint16((0x0192 << 4) + address, value, true);
+      }
+      checkpoint.physicalMemory.set([1, 2, 3, 4], 0x30000 + 122);
+      checkpoint.physicalMemory.set([5, 6, 7, 8], 0x30000 + 162);
+    });
+    assert.equal(region.result.stopReason, 'Forth returned from the entry word.', region.result.trace.join('\n'));
+    assert.deepEqual([...region.runner.readMemory(0x4000, 0, 8)], [1, 2, 3, 4, 5, 6, 7, 8]);
+  }
+  const run = await runRealNative([0xbeef, 0x5000, 0x7000, get(0xf21e, 'BLT-OV')], checkpoint => {
+    const memory = new DataView(checkpoint.physicalMemory.buffer);
+    for (const [address, value] of [[0x5648, 0x3000], [0x563a, 0x6000], [0x6000, 0], [0x586e, 0], [0x5863, 0], [0x5892, 4], [0x55f2, 0x99]]) {
+      memory.setUint16((0x0192 << 4) + address, value, true);
+    }
+    checkpoint.physicalMemory.set([1, 0, 3], 0x50000 + 0x7000);
+  });
+  assert.equal(run.result.stopReason, 'Forth returned from the entry word.', run.result.trace.join('\n'));
+  assert.deepEqual([...run.runner.readMemory(0x3000, 0, 2)], [0x99, 0x90]);
+});
+
+test('native context save/load restores the data stack and RETJMP resumes the saved thread', async () => {
+  const { engine } = await realNativeFixture();
+  const get = (cfa: number) => {
+    const target = engine.get(cfa, 'GAME-OV');
+    assert.ok(target);
+    return target;
+  };
+  const data = await runRealNative([0xbeef, 0x7000, get(0xeb48), 0xcafe, 0x7000, get(0xeb70)], checkpoint => {
+    new DataView(checkpoint.physicalMemory.buffer).setUint16((0x0192 << 4) + 0xde72, 0, true);
+  });
+  assert.equal(data.result.stopReason, 'Forth returned from the entry word.', data.result.trace.join('\n'));
+  assert.match(data.result.trace.at(-2)!, /\[0xbeef\] return$/);
+  const saved = await runRealNative([0xbeef, 0x7000, get(0xeba8)]);
+  assert.equal(saved.result.stopReason, 'Forth returned from the entry word.', saved.result.trace.join('\n'));
+  const jumped = await runRealNative([0xbeef, 0x7000, get(0xebd0), 0xbad], checkpoint => {
+    const memory = new DataView(checkpoint.physicalMemory.buffer);
+    const returnBase = memory.getUint16((0x0192 << 4) + 0x078e, true);
+    memory.setUint16((0x0192 << 4) + 0xde6e, 0, true);
+    memory.setUint16((0x0192 << 4) + 0x7000, returnBase - 2, true);
+    memory.setUint16((0x0192 << 4) + 0x7002 + 218, 0x1010, true);
+  });
+  assert.equal(jumped.result.stopReason, 'Forth returned from the entry word.', jumped.result.trace.join('\n'));
+  assert.match(jumped.result.trace.at(-2)!, /\[0xbeef\] return$/);
+});
+
+test('native site EGA transfer copies all four planes in both directions', async () => {
+  const { engine } = await realNativeFixture();
+  const target = engine.get(0xf0bf, 'SITE-OV');
+  assert.ok(target);
+  for (const direction of [0, 1]) {
+    const { runner, result } = await runRealNative([0xbeef, direction, target], checkpoint => {
+      const memory = new DataView(checkpoint.physicalMemory.buffer);
+      for (const [address, value] of [[0x55e6, 0xa000], [0x55d8, 0xa200], [0x563a, 0x6000], [0x6000 + 197 * 2, 0x200]]) {
+        memory.setUint16((0x0192 << 4) + address, value, true);
+      }
+      checkpoint.ega.planes.forEach((plane, index) => {
+        plane.fill(0);
+        plane.fill(0x31 + index, (direction ? 0x2000 : 0) + 0x200, (direction ? 0x2000 : 0) + 0x200 + 0xa28);
+      });
+    });
+    assert.equal(result.stopReason, 'Forth returned from the entry word.', result.trace.join('\n'));
+    runner.saveState().ega.planes.forEach((plane, index) => {
+      const offset = (direction ? 0 : 0x2000) + 0x200;
+      assert.ok(plane.subarray(offset, offset + 0xa28).every(value => value === 0x31 + index));
+    });
+  }
+});
+
+test('native EGA routines plot, XOR, read pixels, fill tiles and compute extents', async () => {
+  const { engine } = await realNativeFixture();
+  const find = (name: string) => {
+    const target = engine.get(name, 'KERNEL');
+    assert.ok(target, name);
+    return target;
+  };
+  const setup = (checkpoint: ReturnType<ForthBootRunner['saveState']>) => {
+    const memory = new DataView(checkpoint.physicalMemory.buffer);
+    const poke = (address: number, value: number) => memory.setUint16((0x0192 << 4) + address, value, true);
+    for (const plane of checkpoint.ega.planes) plane.fill(0);
+    for (const [address, value] of [[0x5648, 0xa000], [0x563a, 0x6000], [0x55f2, 9], [0x5745, 159],
+      [0x58cd, 0x6a3f], [0x6a3f, 9], [0x5a79, 4], [0x5a86, 1], [0x5a93, 1], [0x5a65, 20], [0x5a6e, 30]]) poke(address, value);
+    for (let row = 0; row < 200; row++) poke(0x6000 + row * 2, row * 40);
+  };
+  const { runner, result } = await runRealNative([
+    0xbeef, 8, 10, find('SQLPLOT'), 8, 10, find('L@PIXEL'),
+    12, 20, 2, 4, find('TILEFILL'), find('EEXTENT')
+  ], setup);
+  assert.equal(result.stopReason, 'Forth returned from the entry word.', result.trace.join('\n'));
+  assert.match(result.trace.at(-2)!, /\[0xbeef 0x0009 0x0010 0x001a 0x0018 0x0022\] return$/);
+  const pixel = (x: number, y: number) => result.graphics!.pixels[y * 320 + x * 2];
+  assert.deepEqual([pixel(8, 10), pixel(8, 11), pixel(8, 12)], [9, 9, 0]);
+  assert.deepEqual([pixel(11, 19), pixel(12, 19), pixel(15, 20), pixel(16, 20)], [0, 9, 9, 0]);
+  assert.equal(runner.saveState().ega.graphics[1], 15);
+  const xor = await runRealNative([8, 10, find('LXPLOT'), 8, 10, find('LXPLOT'), 8, 10, find('L@PIXEL')], setup);
+  assert.equal(xor.result.stopReason, 'Forth returned from the entry word.', xor.result.trace.join('\n'));
+  assert.match(xor.result.trace.at(-2)!, /\[0x0000\] return$/);
+  const arc = await runRealNative([find('ARC')], checkpoint => {
+    setup(checkpoint);
+    new DataView(checkpoint.physicalMemory.buffer).setUint16((0x0192 << 4) + 0x5aa0, 0x0b20, true);
+  });
+  assert.equal(arc.result.stopReason, 'Forth returned from the entry word.', arc.result.trace.join('\n'));
+  assert.ok(arc.result.graphics!.pixels.some(color => color === 9));
+});
+
+test('translated ARC handles four/eight-way plotting and scanline helpers', async () => {
+  const { engine } = await realNativeFixture();
+  const arc = engine.get('ARC', 'KERNEL');
+  assert.ok(arc);
+  for (const helper of [0x0b20, 0x0c01, 0x0b53, 0x0be7]) {
+    const { runner, result } = await runRealNative([arc], checkpoint => {
+      const memory = new DataView(checkpoint.physicalMemory.buffer);
+      const poke = (address: number, value: number) => memory.setUint16((0x0192 << 4) + address, value, true);
+      checkpoint.ega.planes.forEach(plane => plane.fill(0));
+      for (const [address, value] of [[0x5648, 0xa000], [0x563a, 0x6000], [0x55f2, 9], [0x5738, 0], [0x5745, 159],
+        [0x5752, 0], [0x575f, 199], [0x5a79, 4], [0x5a86, 1], [0x5a93, 1], [0x5a65, 20], [0x5a6e, 30], [0x5aa0, helper],
+        [0x57d9, 0x7000]]) poke(address, value);
+      for (let row = 0; row < 200; row++) { poke(0x6000 + row * 2, row * 40); poke(0x7000 + row * 2, 0xffff); }
+    });
+    assert.equal(result.stopReason, 'Forth returned from the entry word.', result.trace.join('\n'));
+    if (helper === 0x0b20 || helper === 0x0c01) {
+      assert.equal(result.graphics!.pixels[34 * 320 + 20 * 2], 9);
+      assert.equal(result.graphics!.pixels[30 * 320 + 24 * 2], helper === 0x0c01 ? 9 : 0);
+    } else {
+      const memory = new DataView(runner.saveState().physicalMemory.buffer);
+      assert.equal(memory.getUint16((0x0192 << 4) + 0x7000 + 34 * 2, true), 0x1513);
+      assert.equal(memory.getUint16((0x0192 << 4) + 0x7000 + 30 * 2, true), helper === 0x0be7 ? 0x1810 : 0xffff);
+      assert.ok(result.graphics!.pixels.every(color => color === 0));
+    }
+  }
+});
+
+test('RP@ exposes return-stack memory and writes through ! affect R>', async () => {
+  const { engine } = await realNativeFixture();
+  const find = (name: string) => {
+    const target = engine.get(name, 'KERNEL');
+    assert.ok(target);
+    return target;
+  };
+  const { result } = await runRealNative([0xaaaa, find('>R'), 0xbbbb, find('RP@'), find('!'), find('R>')]);
+  assert.equal(result.stopReason, 'Forth returned from the entry word.', result.trace.join('\n'));
+  assert.match(result.trace.at(-2)!, /\[0xbbbb\] return$/);
+});
+
+test('native kernel routines execute from real images with register and stack effects', async () => {
+  const { engine } = await realNativeFixture();
+  const find = (name: string) => {
+    const target = engine.get(name, 'KERNEL');
+    assert.ok(target, name);
+    return target;
+  };
+  const { runner, result } = await runRealNative([
+    0xbeef, 0x1234, 1, find('SHL-BIT'), 10, 20, 1, 2, find('BUFFERX'),
+    0, find('COLORMA'), find('SETCOLO'), find('S/RON'), find('RP@'),
+    find('@'), 0x55, 0x123, find('P!'), 0x123, find('P@')
+  ], checkpoint => {
+    const memory = new DataView(checkpoint.physicalMemory.buffer);
+    for (const address of [0x4e53, 0x4e49, 0x596b, 0x595d]) memory.setUint16((0x0192 << 4) + address, 0, true);
+    checkpoint.physicalMemory[(0x0192 << 4) + 0x6a3f] = 9;
+    checkpoint.physicalMemory[(0x0192 << 4) + 0x6a41] = 7;
+  });
+  assert.equal(result.stopReason, 'Forth returned from the entry word.', result.trace.join('\n'));
+  assert.match(result.trace.at(-2)!, /\[0xbeef 0x2469 0x0014 0x0053 0x[0-9a-f]{4} 0x0055\] return$/);
+  const ega = runner.saveState().ega;
+  assert.equal(ega.graphics[0], 9);
+  assert.equal(ega.graphics[1], 15);
+});
+
+test('basic native helpers preserve wrapping and banked memory semantics', () => {
+  const result = createRunner([
+    0xffff, '4*', '3+',
+    0xabcd, 0x1234, 0x13, '!L', 0x1234, 3, '@L',
+    0x55, 0x6000, 'C!', 0x6000, 0xffaa, 'TOGGLE', 0x6000, 'C@'
+  ], new Uint8Array(), new Uint8Array()).run();
+  assert.equal(result.stopReason, 'Forth returned from the entry word.');
+  assert.match(result.trace.at(-2)!, /\[0xffff 0xabcd 0x00ff\] return$/);
+});
+
+test('?IID filters icon IDs with exclusive bounds, descending indices and native signed branches', () => {
+  const cases = [
+    { lower: 10, upper: 20, start: 2, count: 6, icons: [[2, 9], [3, 10], [4, 11], [5, 19], [6, 20], [7, 21]], expected: [5, 4, 2] },
+    { lower: 0xffff, upper: 256, start: 0, count: 2, icons: [[0, 0], [1, 255]], expected: [1, 0, 2] },
+    { lower: 10, upper: 20, start: 0xffff, count: 2, icons: [[0xffff, 16], [0, 15]], expected: [0, 0xffff, 2] },
+    { lower: 0xffff, upper: 0x8000, start: 0, count: 1, icons: [[0, 0]], expected: [0, 1] },
+    { lower: 0xffff, upper: 0x8100, start: 0, count: 1, icons: [[0, 0]], expected: [0] },
+    { lower: 0, upper: 20, start: 5, count: 0, icons: [], expected: [0] },
+    { lower: 0, upper: 20, start: 5, count: 0xffff, icons: [], expected: [0] }
+  ];
+  for (const { lower, upper, start, count, icons, expected } of cases) {
+    const runner = createRunner([0xbeef, lower, upper, start, count, '?IID'], new Uint8Array(), new Uint8Array());
+    runner.start();
+    const checkpoint = runner.saveState();
+    new DataView(checkpoint.physicalMemory.buffer).setUint16((0x0192 << 4) + 0x59c6, 0x3000, true);
+    for (const [index, id] of icons) checkpoint.physicalMemory[(0x3000 << 4) + index] = id;
+    runner.loadState(checkpoint);
+    runner.advance(100);
+    const result = runner.snapshot();
+    assert.equal(result.stopReason, 'Forth returned from the entry word.', result.trace.join('\n'));
+    const stack = [0xbeef, ...expected].map(cell => `0x${cell.toString(16).padStart(4, '0')}`).join(' ');
+    assert.ok(result.trace.at(-2)!.endsWith(`[${stack}] return`), result.trace.join('\n'));
+    const memory = new DataView(runner.saveState().physicalMemory.buffer);
+    assert.equal(memory.getUint16((0x0192 << 4) + 0x5b04, true), start);
+    assert.equal(memory.getUint16((0x0192 << 4) + 0x48c8, true), lower);
+  }
+});
+
+test('XCHGICON swaps all six icon tables with word-index wrapping and no adjacent changes', () => {
+  const tables = [[0x59c6, 1], [0x59ca, 1], [0x59da, 1], [0x59be, 2], [0x59c2, 2], [0x59ce, 2]];
+  for (const [first, second] of [[2, 5], [3, 3], [0xffff, 0x8001]]) {
+    const runner = createRunner([0xbeef, first, second, 'XCHGICON'], new Uint8Array(), new Uint8Array());
+    runner.start();
+    const checkpoint = runner.saveState();
+    const memory = new DataView(checkpoint.physicalMemory.buffer);
+    const expected = tables.map(([segmentCell, size], tableIndex) => {
+      const segment = 0x3000 + tableIndex * 0x1000;
+      memory.setUint16((0x0192 << 4) + segmentCell, segment, true);
+      const bytes = Uint8Array.from({ length: 0x10000 }, (_, offset) => (offset * 17 + (offset >>> 8) + tableIndex * 29) & 0xff);
+      checkpoint.physicalMemory.set(bytes, segment << 4);
+      for (let byte = 0; byte < size; byte++) {
+        const firstOffset = ((first * size) & 0xffff) + byte;
+        const secondOffset = ((second * size) & 0xffff) + byte;
+        const value = bytes[firstOffset];
+        bytes[firstOffset] = bytes[secondOffset];
+        bytes[secondOffset] = value;
+      }
+      return { segment, bytes };
+    });
+    runner.loadState(checkpoint);
+    runner.advance(100);
+    const result = runner.snapshot();
+    assert.equal(result.stopReason, 'Forth returned from the entry word.', result.trace.join('\n'));
+    assert.match(result.trace.at(-2)!, /\[0xbeef\] return$/);
+    const restoredMemory = runner.saveState().physicalMemory;
+    for (const { segment, bytes } of expected) {
+      assert.deepEqual(restoredMemory.subarray(segment << 4, (segment << 4) + 0x10000), bytes);
+    }
+  }
+});
+
+test('?ILOCUS finds descending icon indices with inclusive signed 16-bit bounds', () => {
+  const cases = [
+    { center: [10, 20], radius: 3, start: 2, count: 4, icons: [[2, 10, 20], [3, 10, 24], [4, 14, 20], [5, 13, 17]], expected: [5, 2, 2] },
+    { center: [0xffff, 0xffff], radius: 1, start: 0, count: 2, icons: [[0, 0, 0], [1, 0xfffe, 0xfffe]], expected: [1, 0, 2] },
+    { center: [0, 0], radius: 0, start: 0x7fff, count: 2, icons: [[0, 0, 0], [0x7fff, 0, 0]], expected: [0, 0x7fff, 2] },
+    { center: [0, 0], radius: 0, start: 0, count: 1, icons: [[0, 0x8000, 0x8000]], expected: [0, 1] },
+    { center: [0, 0], radius: 0xffff, start: 0, count: 1, icons: [[0, 0, 0]], expected: [0] },
+    { center: [0, 0], radius: 0, start: 0, count: 0, icons: [], expected: [0] },
+    { center: [0, 0], radius: 0, start: 0, count: 0xffff, icons: [], expected: [0] }
+  ];
+  for (const { center, radius, start, count, icons, expected } of cases) {
+    const runner = createRunner([0xbeef, ...center, radius, start, count, '?ILOCUS'], new Uint8Array(), new Uint8Array());
+    runner.start();
+    const checkpoint = runner.saveState();
+    const pokeWord = (segment: number, offset: number, value: number) => {
+      const address = (segment << 4) + (offset & 0xffff);
+      checkpoint.physicalMemory[address] = value & 0xff;
+      checkpoint.physicalMemory[address + 1] = value >>> 8;
+    };
+    pokeWord(0x0192, 0x59be, 0x3000);
+    pokeWord(0x0192, 0x59c2, 0x4000);
+    for (const [index, horizontal, vertical] of icons) {
+      pokeWord(0x3000, index * 2, horizontal);
+      pokeWord(0x4000, index * 2, vertical);
+    }
+    runner.loadState(checkpoint);
+    runner.advance(100);
+    const result = runner.snapshot();
+    assert.equal(result.stopReason, 'Forth returned from the entry word.', result.trace.join('\n'));
+    const stack = [0xbeef, ...expected].map(cell => `0x${cell.toString(16).padStart(4, '0')}`).join(' ');
+    assert.ok(result.trace.at(-2)!.endsWith(`[${stack}] return`), result.trace.join('\n'));
+    const memory = new DataView(runner.saveState().physicalMemory.buffer);
+    for (const [address, value] of [[0x5af8, center[0]], [0x5afc, center[1]], [0x5b00, radius], [0x5b04, start]]) {
+      assert.equal(memory.getUint16((0x0192 << 4) + address, true), value);
+    }
+  }
+});
+
+test('D2* shifts a double cell with carry, overflow and stack preservation', () => {
+  const cases = [
+    [0, 0], [1, 0], [0x7fff, 0], [0x8000, 0], [0xffff, 0],
+    [0, 0x8000], [0xffff, 0xffff], [0x1234, 0xabcd], [0x8001, 0x7fff]
+  ];
+  for (const [low, high] of cases) {
+    const doubled = (((BigInt(high) << 16n) | BigInt(low)) << 1n) & 0xffffffffn;
+    const expected = [Number(doubled & 0xffffn), Number(doubled >> 16n)];
+    const result = createRunner([0xbeef, low, high, 'D2*'], new Uint8Array(), new Uint8Array()).run();
+    assert.equal(result.stopReason, 'Forth returned from the entry word.', result.trace.join('\n'));
+    const stack = [0xbeef, ...expected].map(cell => `0x${cell.toString(16).padStart(4, '0')}`).join(' ');
+    assert.ok(result.trace.at(-2)!.endsWith(`[${stack}] return`), result.trace.join('\n'));
+  }
+});
+
+test('EASY-BITS follows the native shifts, sign-bit branch and 16-bit loop count', () => {
+  const cases = [
+    { input: [0, 0, 1, 1], expected: [0, 0, 1] },
+    { input: [0xc000, 0, 1, 1], expected: [0, 2, 5] },
+    { input: [0x8000, 0, 3, 1], expected: [0, 2, 5] },
+    { input: [0xffff, 0xffff, 0xffff, 1], expected: [0xfffc, 0, 1] },
+    { input: [0, 0x2000, 1, 1], expected: [0, 0x7fff, 5] },
+    { input: [0, 0x4000, 0, 1], expected: [0, 0, 3] },
+    { input: [0xffff, 0, 1, 2], expected: [0xfff0, 6, 13] },
+    { input: [0xffff, 0, 1, 8], expected: [0, 510, 1021] },
+    { input: [0, 0, 1, 0], expected: [0, 0, 1] }
+  ];
+  for (const { input, expected } of cases) {
+    const result = createRunner([0xbeef, ...input, 'EASY-BITS'], new Uint8Array(), new Uint8Array()).run();
+    assert.equal(result.stopReason, 'Forth returned from the entry word.', result.trace.join('\n'));
+    const stack = [0xbeef, ...expected].map(cell => `0x${cell.toString(16).padStart(4, '0')}`).join(' ');
+    assert.ok(result.trace.at(-2)!.endsWith(`[${stack}] return`), result.trace.join('\n'));
+    assert.ok(result.trace.some(line => line.endsWith(`square-root steps: ${input[3] || 0x10000}`)));
+  }
+});
+
+test('headerless 0x9a80 fetches the unsigned icon byte without scaling its index', async () => {
+  const target = word('W_0x9a80', 0x9a80, 0x9a82);
+  for (const [segment, index, value] of [[0x3000, 8, 0x80], [0x0192, 0x8000, 0xab], [0x4000, 0xffff, 0xff], [0xffff, 0x10, 0]]) {
+    const address = ((segment << 4) + index) & 0xfffff;
+    const { runner, result } = await runRealNative([0xbeef, segment, target], checkpoint => {
+      new DataView(checkpoint.physicalMemory.buffer).setUint16((0x0192 << 4) + 0x5a02, index, true);
+      checkpoint.physicalMemory[address] = value;
+      checkpoint.physicalMemory[(address + 1) & 0xfffff] = 0xcd;
+    });
+    assert.equal(result.stopReason, 'Forth returned from the entry word.', result.trace.join('\n'));
+    assert.ok(result.trace.at(-2)!.endsWith(`[0xbeef 0x${value.toString(16).padStart(4, '0')}] return`), result.trace.join('\n'));
+    const memory = runner.saveState().physicalMemory;
+    assert.equal(memory[address], value);
+    assert.equal(memory[(address + 1) & 0xfffff], 0xcd);
+  }
+});
+
+test('!IW stores a little-endian word at twice the icon index with 16-bit wrapping', () => {
+  const cases = [
+    { segment: 0x3000, index: 8, value: 0xabcd },
+    { segment: 0x0192, index: 0x4000, value: 0x1200 },
+    { segment: 0x4000, index: 0xffff, value: 0xfffe },
+    { segment: 0x3000, index: 0x8001, value: 0x5678 },
+    { segment: 0xffff, index: 8, value: 0x1234 }
+  ];
+  for (const { segment, index, value } of cases) {
+    const offset = (index * 2) & 0xffff;
+    const before = (offset - 1) & 0xffff;
+    const after = (offset + 2) & 0xffff;
+    const operations: Operation[] = [
+      0xbeef,
+      index & 0xff, 0x5a02, 'C!', index >>> 8, 0x5a03, 'C!',
+      0x11, segment, before, 'LC!', 0x22, segment, after, 'LC!',
+      value, segment, '!IW',
+      segment, before, 'LC@', segment, offset, 'LC@',
+      segment, offset + 1, 'LC@', segment, after, 'LC@'
+    ];
+    const result = createRunner(operations, new Uint8Array(), new Uint8Array()).run();
+    assert.equal(result.stopReason, 'Forth returned from the entry word.', result.trace.join('\n'));
+    const stack = [0xbeef, 0x11, value & 0xff, value >>> 8, 0x22]
+      .map(cell => `0x${cell.toString(16).padStart(4, '0')}`).join(' ');
+    assert.ok(result.trace.at(-2)!.endsWith(`[${stack}] return`), result.trace.join('\n'));
+  }
+});
+
+test('!IB stores only the low byte at the current icon offset in the supplied segment', () => {
+  const cases = [
+    { segment: 0x3000, offset: 8, value: 0xabcd },
+    { segment: 0x0192, offset: 0x8000, value: 0x1200 },
+    { segment: 0x4000, offset: 0xffff, value: 0xfffe },
+    { segment: 0xffff, offset: 0x10, value: 0x1234 }
+  ];
+  for (const { segment, offset, value } of cases) {
+    const before = (offset - 1) & 0xffff;
+    const after = (offset + 1) & 0xffff;
+    const operations: Operation[] = [
+      0xbeef,
+      offset & 0xff, 0x5a02, 'C!', offset >>> 8, 0x5a03, 'C!',
+      0x11, segment, before, 'LC!', 0x22, segment, after, 'LC!',
+      value, segment, '!IB',
+      segment, before, 'LC@', segment, offset, 'LC@', segment, after, 'LC@'
+    ];
+    const result = createRunner(operations, new Uint8Array(), new Uint8Array()).run();
+    assert.equal(result.stopReason, 'Forth returned from the entry word.', result.trace.join('\n'));
+    const stack = [0xbeef, 0x11, value & 0xff, 0x22].map(cell => `0x${cell.toString(16).padStart(4, '0')}`).join(' ');
+    assert.ok(result.trace.at(-2)!.endsWith(`[${stack}] return`), result.trace.join('\n'));
+  }
+});
+
+test('headerless 0x4d5a computes far 2D-array addresses with 16-bit wrapping', () => {
+  const cases = [
+    { descriptor: 0x0600, table: 0x8000, segment: 0x3000, row: 3, column: 7, rowOffset: 120, expected: 127 },
+    { descriptor: 0x0600, table: 0xfffe, segment: 0x4000, row: 1, column: 0x30, rowOffset: 0xfff0, expected: 0x20 },
+    { descriptor: 0xfffc, table: 0x9000, segment: 0x5000, row: 0x8001, column: 0xffff, rowOffset: 10, expected: 9 }
+  ];
+  for (const { descriptor, table, segment, row, column, rowOffset, expected } of cases) {
+    const tokens: ForthToken[] = [0xabcd, column, row, descriptor].map((value, index) => ({
+      addr: 0x1000 + index * 4, addrHex: `0x${(0x1000 + index * 4).toString(16)}`,
+      cfa: 0, cfaHex: '0x0000', name: String(value), kind: 'lit', arg: value
+    }));
+    tokens.push(
+      { addr: 0x1010, addrHex: '0x1010', cfa: 0x4d5a, cfaHex: '0x4d5a', name: 'W_0x4d5a', kind: 'call' },
+      { addr: 0x1012, addrHex: '0x1012', cfa: CFA_EXIT1, cfaHex: '0x1690', name: ';', kind: 'exit' }
+    );
+    const image = new Uint8Array(0x4e00);
+    image.set([0x5c, 0x4d], 0x4d5a - 0x100);
+    const runner = new ForthBootRunner(new ForthEngine([word('TEST', 0x0937, CODE_CALL, tokens)]), image, {
+      stara: new Uint8Array(), starb: new Uint8Array()
+    });
+    runner.start();
+    const checkpoint = runner.saveState();
+    const pokeWord = (targetSegment: number, address: number, value: number) => {
+      checkpoint.physicalMemory[(targetSegment << 4) + (address & 0xffff)] = value & 0xff;
+      checkpoint.physicalMemory[(targetSegment << 4) + ((address + 1) & 0xffff)] = value >>> 8;
+    };
+    pokeWord(0x0192, descriptor + 4, table);
+    pokeWord(0x0192, descriptor + 6, segment);
+    pokeWord(segment, table + row * 2, rowOffset);
+    runner.loadState(checkpoint);
+    assert.equal(runner.advance(100), 'stopped');
+    const result = runner.snapshot();
+    assert.equal(result.stopReason, 'Forth returned from the entry word.', result.trace.join('\n'));
+    const stack = [0xabcd, segment, expected].map(value => `0x${value.toString(16).padStart(4, '0')}`).join(' ');
+    assert.ok(result.trace.at(-2)!.endsWith(`[${stack}] return`), result.trace.join('\n'));
+  }
+});
+
+test('checkpoints restore execution, memory and private disks without sharing mutable state', () => {
+  const operations: Operation[] = [
+    ...transfer(0x3000, 8, 1500), 0xab, 0x3000, 8, 'LC!',
+    ...transfer(0x3000, 8, 1500, 0),
+    ...transfer(0x4000, 8, 1500), 0x4000, 8, 'LC@', 0xffff, '+BIT'
+  ];
+  const disk = new Uint8Array(BLOCK_SIZE);
+  const runner = createRunner(operations, disk, disk);
+  runner.start();
+  runner.advance(16);
+  const checkpoint = runner.saveState();
+  runner.advance(100);
+  const expected = runner.snapshot();
+  const restored = createRunner(operations, disk, disk);
+  assert.equal(restored.loadState(structuredClone(checkpoint)), 'running');
+  restored.advance(100);
+  assert.deepEqual(restored.snapshot(), expected);
+  assert.equal(restored.loadState(checkpoint), 'running');
+  restored.advance(100);
+  assert.deepEqual(restored.snapshot(), expected);
+  assert.throws(() => restored.loadState({ ...checkpoint, version: 2 } as unknown as typeof checkpoint), /version/);
+  assert.deepEqual(restored.snapshot(), expected);
+});
+
+test('checkpoints resume nested calls, queued keys, input waits and breakpoints', () => {
+  const key = word('(KEY)', 0x25d5, 0x25d7);
+  const time = word('TIME', 0x2a98, 0x2a9a);
+  const call = (addr: number, target: ForthWord): ForthToken => ({
+    addr, addrHex: `0x${addr.toString(16)}`, cfa: target.cfa, cfaHex: target.cfaHex, name: target.name, kind: 'call'
+  });
+  const exit = (addr: number): ForthToken => ({
+    addr, addrHex: `0x${addr.toString(16)}`, cfa: CFA_EXIT1, cfaHex: '0x1690', name: ';', kind: 'exit'
+  });
+  const inner = word('INNER', 0x3000, CODE_CALL, [call(0x3002, key), call(0x3004, key), exit(0x3006)]);
+  const entry = word('TEST', 0x0937, CODE_CALL, [call(0x1000, inner), call(0x1002, time), exit(0x1004)]);
+  const create = () => new ForthBootRunner(new ForthEngine([key, time, inner, entry]), new Uint8Array(), {
+    stara: new Uint8Array(), starb: new Uint8Array()
+  });
+  for (const state of ['running', 'waiting', 'break'] as const) {
+    const runner = create();
+    runner.start(0x0937, state === 'waiting' ? [biosKey('A')!] : [biosKey('A')!, biosKey('B')!]);
+    if (state === 'break') runner.setBreakpoint('KERNEL', inner.cfa);
+    assert.equal(runner.advance(state === 'running' ? 1 : 100), state);
+    const checkpoint = runner.saveState();
+    if (state === 'waiting') runner.pressKey(biosKey('B')!);
+    runner.advance(100);
+    const expected = runner.snapshot();
+    assert.equal(expected.stopReason, 'Forth returned from the entry word.');
+    const restored = create();
+    assert.equal(restored.loadState(checkpoint), state);
+    if (state === 'waiting') restored.pressKey(biosKey('B')!);
+    restored.advance(100);
+    assert.deepEqual(restored.snapshot(), expected);
+  }
+});
+
+test('EGA checkpoints preserve plane data, latches and selected registers', () => {
+  const ega = new EgaAdapter();
+  ega.out(0x3ce, 1);
+  ega.out(0x3cf, 0);
+  ega.write(10, 0xa5);
+  ega.read(10);
+  ega.out(0x3ce, 5);
+  const checkpoint = ega.saveState();
+  const restored = new EgaAdapter();
+  restored.loadState(structuredClone(checkpoint));
+  restored.out(0x3cf, 1);
+  restored.write(20, 0);
+  assert.ok(restored.planes.every(plane => plane[20] === 0xa5));
+  assert.ok(checkpoint.planes.every(plane => plane[20] === 0));
+});
+
+test('+BIT counts set bits in a 16-bit cell and preserves the rest of the stack', () => {
+  const cases = [
+    [0, 0], [0xffff, 16], [0xaaaa, 8], [0x5555, 8], [0x8001, 2], [0x7fff, 15],
+    ...Array.from({ length: 16 }, (_, bit) => [1 << bit, 1])
+  ];
+  for (const [value, expected] of cases) {
+    const result = createRunner([0xabcd, value, '+BIT'], new Uint8Array(), new Uint8Array()).run();
+    assert.equal(result.stopReason, 'Forth returned from the entry word.');
+    assert.ok(result.trace.at(-2)!.endsWith(`[0xabcd 0x${expected.toString(16).padStart(4, '0')}] return`), result.trace.join('\n'));
+  }
+});
+
+test('RECADD advances record addresses across block boundaries and unused tails', () => {
+  const cases = [
+    { index: 0, size: 100, offset: 200, block: 7, expected: [200, 7] },
+    { index: 7, size: 100, offset: 200, block: 7, expected: [900, 7] },
+    { index: 8, size: 100, offset: 200, block: 7, expected: [0, 8] },
+    { index: 29, size: 100, offset: 200, block: 7, expected: [100, 10] },
+    { index: 1, size: 100, offset: 1000, block: 7, expected: [100, 8] },
+    { index: 8, size: 128, offset: 0, block: 7, expected: [0, 8] },
+    { index: 1, size: 1024, offset: 0, block: 0xffff, expected: [0, 0] },
+    { index: 0xffff, size: 100, offset: 200, block: 7, expected: [100, 7] }
+  ];
+  for (const { index, size, offset, block, expected } of cases) {
+    const result = createRunner([0xabcd, index, size, offset, block, 'RECADD'], new Uint8Array(), new Uint8Array()).run();
+    assert.equal(result.stopReason, 'Forth returned from the entry word.');
+    const stack = [0xabcd, ...expected].map(value => `0x${value.toString(16).padStart(4, '0')}`).join(' ');
+    assert.ok(result.trace.at(-2)!.endsWith(`[${stack}] return`), result.trace.join('\n'));
+  }
+});
 
 test('R/W reads every byte of both mounted images and consumes its arguments', () => {
   const stara = Uint8Array.from({ length: BLOCK_SIZE * 2 }, (_, index) => index % 251);
@@ -489,9 +1284,10 @@ test('INT 21h AH=22h writes the DTA into a private image, extending it past the 
   assert.equal(stara[0], 0x40);
 });
 
-test('PLOT draws on the hidden EGA page and the latch copy moves all planes to the visible page', () => {
+for (const [name, cfa, codep] of [['PLOT', 0x9365, 0x9367], ['LPLOT', 0x9000, 0x9002]] as const) {
+test(`${name} draws on the hidden EGA page and the latch copy moves all planes to the visible page`, () => {
   const lores = word('>LORES', 0x8d89, 0x8d8b);
-  const plot = word('PLOT', 0x9365, 0x9367);
+  const plot = word(name, cfa, codep);
   const copy = word('W_0x8e4d', 0x8e4d, 0x8e4f);
   const fetchByte = word('LC@', 0x2ecb, 0x2ecd);
   let addr = 0x1000;
@@ -517,7 +1313,24 @@ test('PLOT draws on the hidden EGA page and the latch copy moves all planes to t
   poke(0x563a, 0x00, 0x60); // YTABL -> row table at 6000h
   for (let row = 0; row < 8; row++) poke(0x6000 + row * 2, (row * 40) & 0xff, (row * 40) >> 8);
   poke(0x92cf, 0xc0, 0, 0x30, 0, 0x0c, 0, 0x03, 0);
-  const result = runImage([lores, plot, copy, fetchByte, entry], image);
+  const runner = new ForthBootRunner(new ForthEngine([lores, plot, copy, fetchByte, entry]), image, {
+    stara: new Uint8Array(), starb: new Uint8Array()
+  });
+  runner.start();
+  runner.advance(1);
+  if (name === 'LPLOT') {
+    const checkpoint = runner.saveState();
+    checkpoint.ega.graphics[1] = 0;
+    runner.loadState(checkpoint);
+  }
+  runner.advance(3);
+  if (name === 'LPLOT') {
+    const ega = runner.saveState().ega;
+    assert.equal(ega.graphics[1], 0x0f);
+    assert.equal(ega.graphicsIndex, 0);
+  }
+  runner.advance(100);
+  const result = runner.snapshot();
   assert.equal(result.stopReason, 'Forth returned from the entry word.', result.trace.join('\n'));
   assert.match(result.trace[3], /plot 7,4 color 9$/);
   assert.match(result.trace[8], /EGA latch copy 2000h bytes a200:0 -> a000:0$/);
@@ -526,6 +1339,7 @@ test('PLOT draws on the hidden EGA page and the latch copy moves all planes to t
   const pixel = (x: number, y: number) => result.graphics!.pixels[y * result.graphics!.width + x];
   assert.deepEqual([pixel(13, 4), pixel(14, 4), pixel(15, 4), pixel(16, 4)], [0, 9, 9, 0]);
 });
+}
 
 test('.EGARUNBIT draws even runs, skips odd runs, and wraps a long run up a row', () => {
   const lores = word('>LORES', 0x8d89, 0x8d8b);
@@ -692,6 +1506,50 @@ test('LLINE walks from (x2, y2) to (x1, y1) with the driver\'s Bresenham steps',
   // x steps every point; the error (+2 each) passes the threshold 1 on steps 1 and 3, stepping y:
   // (4,2) (3,1) (2,1) (1,0) (0,0)
   assert.deepEqual([row(2), row(1), row(0)], ['00009', '00990', '99000']);
+});
+
+test('V>DISPLAY copies the packed main view to display rows without changing borders or the stack', () => {
+  const lores = word('>LORES', 0x8d89, 0x8d8b);
+  const display = word('V>DISPLAY', 0x90ab, 0x90ad);
+  const entry = word('TEST', 0x0937, CODE_CALL, [
+    { addr: 0x1000, addrHex: '0x1000', cfa: 0, cfaHex: '0x0000', name: '48879', kind: 'lit', arg: 0xbeef },
+    { addr: 0x1004, addrHex: '0x1004', cfa: lores.cfa, cfaHex: lores.cfaHex, name: lores.name, kind: 'call' },
+    { addr: 0x1006, addrHex: '0x1006', cfa: display.cfa, cfaHex: display.cfaHex, name: display.name, kind: 'call' },
+    { addr: 0x1008, addrHex: '0x1008', cfa: CFA_EXIT1, cfaHex: '0x1690', name: ';', kind: 'exit' }
+  ]);
+  const image = new Uint8Array(0x6800);
+  const pokeWord = (address: number, value: number) => image.set([value & 0xff, value >>> 8], address - 0x100);
+  pokeWord(0x584a, 3);
+  pokeWord(0x55d8, 0xa400);
+  pokeWord(0x55e6, 0xa000);
+  for (let row = 0; row < 120; row++) pokeWord(0x6598 + row * 2, (127 - row) * 40);
+  const runner = new ForthBootRunner(new ForthEngine([lores, display, entry]), image, {
+    stara: new Uint8Array(), starb: new Uint8Array()
+  });
+  runner.start();
+  runner.advance(2);
+  const checkpoint = runner.saveState();
+  const sources = checkpoint.ega.planes.map((plane, index) => {
+    plane.fill(0x5a, 0, 0x2000);
+    const source = Uint8Array.from({ length: 120 * 18 }, (_, offset) => (offset * 7 + index * 53) & 0xff);
+    plane.set(source, 0x4000);
+    return source;
+  });
+  runner.loadState(checkpoint);
+  assert.equal(runner.advance(100), 'stopped');
+  const result = runner.snapshot();
+  assert.equal(result.stopReason, 'Forth returned from the entry word.');
+  assert.match(result.trace.at(-2)!, /\[0xbeef\] return$/);
+  const ega = runner.saveState().ega;
+  ega.planes.forEach((plane, index) => {
+    const expected = new Uint8Array(0x2000).fill(0x5a);
+    for (let row = 0; row < 120; row++) {
+      expected.set(sources[index].subarray(row * 18, (row + 1) * 18), (127 - row) * 40 + 1);
+    }
+    assert.deepEqual(plane.subarray(0, 0x2000), expected);
+    assert.deepEqual(plane.subarray(0x4000, 0x4000 + 120 * 18), sources[index]);
+  });
+  assert.equal(ega.graphics[5], 0);
 });
 
 test('LCOPYBLK copies a block row by row towards its destination, so overlapping copies keep the source', () => {

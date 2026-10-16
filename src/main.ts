@@ -11,12 +11,43 @@ import {
   STEPS_PER_MILLISECOND,
   biosKey,
   type BootState,
+  type ForthCheckpoint,
   type ForthGraphicsScreen,
   type ForthTextScreen
 } from './forth-boot';
 
 // GAME-OV's ?GAME.IN.PROGRESS (:TIMESTAMP @), which START. calls right after the intro screens.
 const INTRO_DONE_CFA = 0xf525;
+
+interface SavedGame {
+  machine: ForthCheckpoint;
+  keysTyped: number;
+  fastForward: boolean;
+  autoEga: boolean;
+  skipIntro: boolean;
+}
+
+async function gameCheckpoint(saved?: SavedGame): Promise<SavedGame | undefined> {
+  const database = await new Promise<IDBDatabase>((resolve, reject) => {
+    const request = indexedDB.open('starflight-checkpoints', 1);
+    request.onupgradeneeded = () => request.result.createObjectStore('checkpoints');
+    request.onsuccess = () => resolve(request.result);
+    request.onerror = () => reject(request.error);
+    request.onblocked = () => reject(new Error('Checkpoint storage is blocked by another tab.'));
+  });
+  try {
+    return await new Promise<SavedGame | undefined>((resolve, reject) => {
+      const transaction = database.transaction('checkpoints', saved ? 'readwrite' : 'readonly');
+      const store = transaction.objectStore('checkpoints');
+      const request = saved ? store.put(saved, 'game') : store.get('game');
+      transaction.oncomplete = () => resolve(saved ?? request.result);
+      transaction.onabort = () => reject(transaction.error ?? new Error('Checkpoint storage was interrupted.'));
+      transaction.onerror = () => reject(transaction.error ?? new Error('Checkpoint storage failed.'));
+    });
+  } finally {
+    database.close();
+  }
+}
 
 // The 16 CGA/EGA text colors, indexed by attribute nibble.
 const TEXT_PALETTE = [
@@ -466,11 +497,14 @@ class GameScreen {
         <section class="boot-console">
           <div class="boot-controls">
             <button id="run-forth-boot" class="btn" type="button">Run Forth Boot</button>
+            <button id="save-game" class="btn" type="button" disabled>Save</button>
+            <button id="load-game" class="btn" type="button">Load</button>
             <label><input id="auto-ega" type="checkbox" checked> Auto-select EGA</label>
             <label><input id="skip-intro" type="checkbox" checked> Skip intro</label>
             <span>Entry: W_0x0937 · 16-bit cells · 64K memory · click the screen and type to send keys</span>
           </div>
           <div id="forth-boot-status" role="status">Ready to start from the first Forth CFA.</div>
+          <div id="checkpoint-status" role="status"></div>
           <pre id="forth-boot-trace">Boot trace will appear here.</pre>
         </section>
       </div>
@@ -490,6 +524,10 @@ class GameScreen {
 
     const status = target.querySelector<HTMLElement>('#forth-boot-status');
     const trace = target.querySelector<HTMLElement>('#forth-boot-trace');
+    const saveButton = target.querySelector<HTMLButtonElement>('#save-game')!;
+    const loadButton = target.querySelector<HTMLButtonElement>('#load-game')!;
+    const checkpointStatus = target.querySelector<HTMLElement>('#checkpoint-status')!;
+    let started = false;
 
     const show = (state: BootState, updateTrace: boolean) => {
       const result = this.runner.snapshot();
@@ -510,18 +548,11 @@ class GameScreen {
 
     // Run the boot in real time: each animation frame executes the steps for the time that has passed, so timed
     // waits such as the intro screens last as long as on the PC. A frame's slice is capped at 100 ms.
-    const play = () => {
+    const resume = (initialState: BootState) => {
       cancelAnimationFrame(this.animationFrame);
-      this.keysTyped = 0;
-      // With "Skip intro", run unpaced until START. reaches ?GAME.IN.PROGRESS (GAME-OV F525h), right after the
-      // splash, title, and police screens; from there on the game runs in real time.
-      this.fastForward = skipIntro?.checked ?? false;
-      this.runner.clearBreakpoints();
-      if (this.fastForward) this.runner.setBreakpoint('GAME-OV', INTRO_DONE_CFA);
-      this.runner.start(0x0937, autoEga?.checked ? egaKeys : []);
       let last = performance.now();
       let lastTrace = 0;
-      let lastState: BootState = 'running';
+      let lastState = initialState;
       const tick = (now: number) => {
         const elapsed = Math.min(now - last, 100);
         last = now;
@@ -543,9 +574,53 @@ class GameScreen {
         show(state, updateTrace);
         if (state !== 'stopped') this.animationFrame = requestAnimationFrame(tick);
       };
-      this.animationFrame = requestAnimationFrame(tick);
+      show(initialState, true);
+      if (initialState !== 'stopped') this.animationFrame = requestAnimationFrame(tick);
       canvas.focus();
     };
+    const play = () => {
+      this.keysTyped = 0;
+      this.fastForward = skipIntro?.checked ?? false;
+      this.runner.clearBreakpoints();
+      if (this.fastForward) this.runner.setBreakpoint('GAME-OV', INTRO_DONE_CFA);
+      this.runner.start(0x0937, autoEga?.checked ? egaKeys : []);
+      started = true;
+      saveButton.disabled = false;
+      checkpointStatus.textContent = '';
+      resume('running');
+    };
+    const persist = async (saving: boolean) => {
+      saveButton.disabled = true;
+      loadButton.disabled = true;
+      checkpointStatus.textContent = saving ? 'Saving checkpoint...' : 'Loading checkpoint...';
+      try {
+        if (saving) {
+          await gameCheckpoint({
+            machine: this.runner.saveState(), keysTyped: this.keysTyped, fastForward: this.fastForward,
+            autoEga: autoEga?.checked ?? false, skipIntro: skipIntro?.checked ?? false
+          });
+          checkpointStatus.textContent = 'Checkpoint saved.';
+        } else {
+          const saved = await gameCheckpoint();
+          if (!saved) throw new Error('No saved checkpoint.');
+          const state = this.runner.loadState(saved.machine);
+          this.keysTyped = saved.keysTyped;
+          this.fastForward = saved.fastForward;
+          if (autoEga) autoEga.checked = saved.autoEga;
+          if (skipIntro) skipIntro.checked = saved.skipIntro;
+          started = true;
+          resume(state);
+          checkpointStatus.textContent = 'Checkpoint loaded.';
+        }
+      } catch (error) {
+        checkpointStatus.textContent = error instanceof Error ? error.message : 'Checkpoint storage is unavailable.';
+      } finally {
+        saveButton.disabled = !started;
+        loadButton.disabled = false;
+      }
+    };
+    saveButton.addEventListener('click', () => { void persist(true); });
+    loadButton.addEventListener('click', () => { void persist(false); });
     target.querySelector('#run-forth-boot')?.addEventListener('click', play);
     autoEga?.addEventListener('change', play);
     skipIntro?.addEventListener('change', play);

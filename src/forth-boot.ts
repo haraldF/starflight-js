@@ -15,7 +15,7 @@ import {
   type ForthWord
 } from './forth-decompiler.ts';
 import { BLOCK_SIZE, type StarflightFS } from './starflight-fs.ts';
-import { EgaAdapter } from './ega.ts';
+import { EgaAdapter, type EgaState } from './ega.ts';
 
 // A BIOS keyboard word to press once a run reaches `step`.
 export interface TimedKey {
@@ -46,6 +46,29 @@ interface CallFrame {
   tokenIndex: number;
   // The address pushed on the return stack when this word was entered; undefined for the entry word.
   returnAddress?: number;
+}
+
+export interface ForthCheckpoint {
+  version: 1;
+  physicalMemory: Uint8Array;
+  disks: { stara: Uint8Array; starb: Uint8Array };
+  dtaSegment: number;
+  dtaOffset: number;
+  videoMode: number;
+  cursorRow: number;
+  cursorCol: number;
+  keyQueue: number[];
+  ega: EgaState;
+  speakerPort: number;
+  speakerDivisor: number;
+  ports?: [number, number][];
+  inferredColons: [string, ForthWord][];
+  breakpoints: string[];
+  session: Omit<BootSession, 'dataStack' | 'trace'> & {
+    stackPointer: number;
+    trace: string[];
+    droppedTraceLines: number;
+  };
 }
 
 const USER_AREA = 0x078c;
@@ -253,6 +276,7 @@ export class ForthBootRunner {
   private speakerPort = 0;
   // PIT channel 2 divisor; the speaker sounds at 1193182 Hz / divisor while port 61h bits 0 and 1 are set.
   private speakerDivisor = 0;
+  private ports = new Map<number, number>();
   // Steps executed so far in this run; the clock reads it.
   private step = 0;
   private readonly traceLines: number;
@@ -263,6 +287,7 @@ export class ForthBootRunner {
     this.initialDisks = { stara: disks.stara.slice(), starb: disks.starb.slice() };
     this.disks = { stara: this.initialDisks.stara.slice(), starb: this.initialDisks.starb.slice() };
     this.physicalMemory = new Uint8Array(0x100000);
+    this.physicalMemory.set([0x87, 0xe9, 0x00, 0xf0], 9 * 4);
     const comPhysicalStart = (0x0192 << 4) + 0x0100;
     this.physicalMemory.set(starflt.subarray(0, Math.min(starflt.length, this.physicalMemory.length - comPhysicalStart)), comPhysicalStart);
     this.memory = this.physicalMemory.subarray(0x0192 << 4, (0x0192 << 4) + 0x10000);
@@ -423,6 +448,7 @@ export class ForthBootRunner {
     this.ega = new EgaAdapter();
     this.speakerPort = 0;
     this.speakerDivisor = 0;
+    this.ports.clear();
     this.step = 0;
     this.setVideoMode(3);
     const readWord = (address: number) => this.memory[address & 0xffff] | (this.memory[(address + 1) & 0xffff] << 8);
@@ -433,7 +459,7 @@ export class ForthBootRunner {
     const entry = this.engine.get(entryCfa, 'KERNEL');
     this.session = {
       dataStack: new MemoryStack(readWord, writeWord),
-      returnStack: [],
+      returnStack: this.memoryReturnStack(),
       frames: entry ? [{ word: entry, tokenIndex: 0 }] : [],
       trace: new TraceBuffer(this.traceLines),
       output: '',
@@ -451,6 +477,96 @@ export class ForthBootRunner {
 
   clearBreakpoints(): void {
     this.breakpoints.clear();
+  }
+
+  private memoryReturnStack(values: number[] = []): number[] {
+    const address = (index: number) => {
+      const base = (this.memory[USER_AREA + 2] | (this.memory[USER_AREA + 3] << 8)) || 0xf7d0;
+      return (base - (index + 1) * 2) & 0xffff;
+    };
+    const stack = new Proxy<number[]>([], {
+      get: (target, property, receiver) => {
+        if (typeof property === 'string' && /^(0|[1-9][0-9]*)$/.test(property)) {
+          const index = Number(property);
+          if (index >= target.length) return undefined;
+          const offset = address(index);
+          return this.memory[offset] | (this.memory[(offset + 1) & 0xffff] << 8);
+        }
+        return Reflect.get(target, property, receiver);
+      },
+      set: (target, property, value, receiver) => {
+        if (typeof property === 'string' && /^(0|[1-9][0-9]*)$/.test(property)) {
+          const offset = address(Number(property));
+          this.memory[offset] = value & 0xff;
+          this.memory[(offset + 1) & 0xffff] = (value >>> 8) & 0xff;
+        }
+        return Reflect.set(target, property, value, receiver);
+      }
+    });
+    stack.push(...values);
+    return stack;
+  }
+
+  saveState(): ForthCheckpoint {
+    const session = this.session;
+    if (!session) throw new Error('Start a game before saving a checkpoint.');
+    const { dataStack, trace, ...execution } = session;
+    return structuredClone({
+      version: 1,
+      physicalMemory: this.physicalMemory,
+      disks: this.disks,
+      dtaSegment: this.dtaSegment, dtaOffset: this.dtaOffset,
+      videoMode: this.videoMode, cursorRow: this.cursorRow, cursorCol: this.cursorCol,
+      keyQueue: this.keyQueue, ega: this.ega.saveState(),
+      speakerPort: this.speakerPort, speakerDivisor: this.speakerDivisor, ports: [...this.ports],
+      inferredColons: [...this.inferredColons], breakpoints: [...this.breakpoints],
+      session: { ...execution, returnStack: [...execution.returnStack], stackPointer: dataStack.pointer, trace: trace.toArray(), droppedTraceLines: trace.dropped }
+    });
+  }
+
+  loadState(checkpoint: ForthCheckpoint): BootState {
+    if (checkpoint?.version !== 1) throw new Error('Unsupported checkpoint version.');
+    if (!(checkpoint.physicalMemory instanceof Uint8Array) || checkpoint.physicalMemory.length !== 0x100000
+      || !(checkpoint.disks?.stara instanceof Uint8Array) || !(checkpoint.disks?.starb instanceof Uint8Array)
+      || !checkpoint.session || !['running', 'waiting', 'break', 'stopped'].includes(checkpoint.session.state)) {
+      throw new Error('Invalid game checkpoint.');
+    }
+    const saved = structuredClone(checkpoint);
+    const ega = new EgaAdapter();
+    ega.loadState(saved.ega);
+    const memory = saved.physicalMemory.subarray(0x0192 << 4, (0x0192 << 4) + 0x10000);
+    const dataStack = new MemoryStack(
+      address => memory[address & 0xffff] | (memory[(address + 1) & 0xffff] << 8),
+      (address, value) => {
+        memory[address & 0xffff] = value & 0xff;
+        memory[(address + 1) & 0xffff] = (value >>> 8) & 0xff;
+      }
+    );
+    dataStack.pointer = saved.session.stackPointer;
+    const trace = new TraceBuffer(this.traceLines);
+    for (const line of saved.session.trace) trace.push(line);
+    trace.dropped += saved.session.droppedTraceLines;
+    this.physicalMemory = saved.physicalMemory;
+    this.memory = memory;
+    this.disks = saved.disks;
+    this.dtaSegment = saved.dtaSegment;
+    this.dtaOffset = saved.dtaOffset;
+    this.videoMode = saved.videoMode;
+    this.cursorRow = saved.cursorRow;
+    this.cursorCol = saved.cursorCol;
+    this.keyQueue = saved.keyQueue;
+    this.ega = ega;
+    this.speakerPort = saved.speakerPort;
+    this.speakerDivisor = saved.speakerDivisor;
+    this.ports = new Map(saved.ports ?? []);
+    this.inferredColons.clear();
+    for (const [key, word] of saved.inferredColons) this.inferredColons.set(key, word);
+    this.clearBreakpoints();
+    for (const key of saved.breakpoints) this.breakpoints.add(key);
+    const { stackPointer, droppedTraceLines, trace: savedTrace, ...execution } = saved.session;
+    this.session = { ...execution, returnStack: this.memoryReturnStack(execution.returnStack), dataStack, trace };
+    this.step = execution.steps;
+    return execution.state;
   }
 
   // Type a key into the running machine; a run waiting in (KEY) continues on its next advance().
@@ -937,6 +1053,694 @@ export class ForthBootRunner {
     };
 
     switch (word.codep) {
+      case 0x92ef: // S/RON ( -- ): enable EGA Set/Reset on all planes
+        this.ega.out(0x3ce, 1);
+        this.ega.out(0x3cf, 15);
+        return { supported: true, note: 'enable EGA Set/Reset', output };
+      case 0x937b: // SETCOLO ( -- ): set the EGA drawing color
+        this.ega.out(0x3ce, 0);
+        this.ega.out(0x3cf, this.memory[0x55f2]);
+        return { supported: true, note: 'set EGA drawing color', output };
+      case 0x9841: { // BUFFERX ( x y x-shift y-shift -- x' y' )
+        const yShift = pop(dataStack, 'data') & 0xff;
+        const xShift = pop(dataStack, 'data') & 0xff;
+        const y = (pop(dataStack, 'data') - readWord(0x4e53) + 1) & 0xffff;
+        const x = (pop(dataStack, 'data') - readWord(0x4e49)) & 0xffff;
+        push(dataStack, (xShift >= 16 ? 0 : (x << xShift) & 0xffff) + readWord(0x595d));
+        push(dataStack, (yShift >= 16 ? 0 : (y << yShift) & 0xffff) + readWord(0x596b) - 1);
+        return { supported: true, note: 'buffer coordinates', output };
+      }
+      case 0x97cc: { // COLORMA ( value -- ): select the terrain color-map entry
+        const value = pop(dataStack, 'data');
+        const entry = 0x6a3f + (value & 0x8000 ? 0 : (value >>> 1) & 0x38);
+        writeWord(0x58cd, entry);
+        writeWord(0x55f2, this.memory[entry]);
+        writeWord(0x55ff, this.memory[entry + 2]);
+        return { supported: true, note: 'select terrain colors', output };
+      }
+      case 0x95be: { // SHL-BIT ( value bit -- value' ): shift in the low bit
+        const bit = pop(dataStack, 'data');
+        push(dataStack, (pop(dataStack, 'data') << 1) | (bit & 1));
+        return { supported: true, note: 'shift in bit', output };
+      }
+      case 0x6cd6: { // E>CGA ( ega -- cga ): reverse the configured color mapping
+        const color = pop(dataStack, 'data') & 15;
+        let entry = 0;
+        for (let index = 15; index >= 0; index--) {
+          if ((this.memory[0x4fcd + index] & 15) === color) { entry = index + 1; break; }
+        }
+        push(dataStack, this.memory[0x4fbb + entry - 1]);
+        return { supported: true, note: 'EGA to CGA color', output };
+      }
+      case 0x0d65: { // P@ ( port -- byte ): input from a modelled device port
+        const port = pop(dataStack, 'data');
+        let value = this.ports.get(port) ?? 0;
+        if (port === 0x61) value = this.speakerPort;
+        else if (port === 0x3da) { value ^= 9; this.ports.set(port, value); }
+        else if (port === 0x60) value = this.keyQueue[0] === undefined ? 0x80 : this.keyQueue[0] >>> 8;
+        else if ([0x3c4, 0x3c5, 0x3ce, 0x3cf].includes(port)) value = this.ega.input(port);
+        push(dataStack, value & 0xff);
+        return { supported: true, note: 'read device port', output };
+      }
+      case 0x0d56: { // P! ( value port -- ): output to a modelled device port
+        const port = pop(dataStack, 'data');
+        const value = pop(dataStack, 'data') & 0xff;
+        this.ports.set(port, value);
+        if (port === 0x61) this.speakerPort = value;
+        this.ega.out(port, value);
+        return { supported: true, note: 'write device port', output };
+      }
+      case 0x0ed8: // RP@ ( -- address ): read the memory-backed return-stack pointer
+        push(dataStack, (readWord(USER_AREA + 2) || 0xf7d0) - returnStack.length * 2);
+        return { supported: true, note: 'return stack pointer', output };
+      case 0x4a0c: // PRTSCR ( -- ): capture BIOS printer output
+        return { supported: true, note: 'capture printed screen', output: output + screenLines(this.snapshotScreen()).join('\n') + '\n' };
+      case 0xb40e: { // XKEYINT ( -- ): apply the keyboard-hook buffer flush before BIOS processing
+        const scan = this.keyQueue[0] === undefined ? 0x80 : this.keyQueue[0] >>> 8;
+        if ((scan & 0x80) === 0) writeFarWord(0x40, 0x1a, readFarWord(0x40, 0x1c));
+        return { supported: true, note: 'keyboard interrupt hook', output };
+      }
+      case 0xdf02: // ORBIT-OV SETQUAD ( -- ): save the quadrant stack pointer
+        if (word.module !== 'ORBIT-OV') break;
+        writeWord(0xdc20, dataStack.pointer);
+        return { supported: true, note: 'save quadrant stack pointer', output };
+      case 0xdf13: { // ORBIT-OV C*/ ( a b divisor -- result ): signed byte scaling
+        if (word.module !== 'ORBIT-OV') break;
+        const signedByte = (value: number) => (value << 24) >> 24;
+        const divisor = signedByte(pop(dataStack, 'data'));
+        const multiplier = signedByte(pop(dataStack, 'data'));
+        const value = signedByte(pop(dataStack, 'data'));
+        const quotient = Math.trunc(value * multiplier / divisor);
+        if (!Number.isFinite(quotient) || quotient < -128 || quotient > 127) throw new RangeError('C*/ divide overflow (INT 0)');
+        push(dataStack, quotient);
+        return { supported: true, note: 'signed byte scaling', output };
+      }
+      case 0xe8f3: // MOVE-OV CBLTP ( x y -- ): configure the cursor bitmap
+      case 0xefd9: { // MOVE-OV / MAPS-OV CBLTP ( x y -- ): configure the cursor bitmap
+        if ((word.codep === 0xe8f3 && word.module !== 'MOVE-OV') || (word.codep === 0xefd9 && word.module !== 'MAPS-OV')) break;
+        writeWord(0x5863, pop(dataStack, 'data') + 3);
+        writeWord(0x586e, pop(dataStack, 'data') + 6);
+        writeWord(0x5892, 4);
+        writeWord(0x5887, 6);
+        writeWord(0x589d, word.module === 'MOVE-OV' ? 0xe8e5 : 0xefcb);
+        writeWord(0x58aa, 0x0192);
+        return { supported: true, note: 'configure cursor bitmap', output };
+      }
+      case 0xf0c1: { // SITE-OV |EGA ( flag -- ): transfer the site's planar screen band
+        if (word.module !== 'SITE-OV') break;
+        const toDisplay = (pop(dataStack, 'data') & 1) !== 0;
+        const offset = readWord(readWord(0x563a) + 197 * 2);
+        const display = readWord(0x55e6), hidden = readWord(0x55d8);
+        this.latchCopy(toDisplay ? hidden : display, offset, toDisplay ? display : hidden, offset, 0xa28);
+        return { supported: true, note: 'copy site EGA band', output };
+      }
+      case 0xf050: // SITE-OV (|REGION) ( segment restore -- ): transfer a packed region
+      case 0xec0c: { // SITE-OV / PORTMENU-OV (|REGION) ( segment restore -- ): transfer a packed region
+        if ((word.codep === 0xf050 && word.module !== 'SITE-OV') || (word.codep === 0xec0c && word.module !== 'PORTMENU-OV')) break;
+        const restore = pop(dataStack, 'data');
+        const segment = pop(dataStack, 'data');
+        writeWord(0x561c, restore);
+        const wordsPerRow = (readWord(0x5892) >>> 2) + 2;
+        const height = readWord(0x5887);
+        if (height === 0) throw new RangeError('(|REGION) requires a nonzero height');
+        const horizontal = readWord(0x586e) >>> 1;
+        const frameSegment = readWord(0x5648);
+        for (let row = 0; row < height; row++) {
+          const screenRow = (readWord(0x5863) - height + row + 1) & 0xffff;
+          const frameOffset = (readWord(readWord(0x563a) + screenRow * 2) + horizontal) & 0xffff;
+          for (let column = 0; column < wordsPerRow; column++) {
+            const packedOffset = (row * wordsPerRow + column) * 2;
+            const screenOffset = frameOffset + column * 2;
+            if (restore) writeFarWord(frameSegment, screenOffset, readFarWord(segment, packedOffset));
+            else writeFarWord(segment, packedOffset, readFarWord(frameSegment, screenOffset));
+          }
+        }
+        return { supported: true, note: restore ? 'restore packed region' : 'save packed region', output };
+      }
+      case 0xf220: { // BLT-OV .RUNBIT ( segment offset -- ): decode a packed CGA run-length bitmap
+        if (word.module !== 'BLT-OV') break;
+        let pointer = pop(dataStack, 'data');
+        const segment = pop(dataStack, 'data');
+        const runs = readFarWord(segment, pointer) || 0x10000;
+        pointer = (pointer + 2) & 0xffff;
+        writeWord(0x58aa, segment);
+        writeWord(0x562e, pointer);
+        const left = readWord(0x586e), width = readWord(0x5892);
+        const end = (left + width) & 0xffff;
+        let horizontal = left, vertical = readWord(0x5863);
+        writeWord(0x5625, end);
+        for (let run = 0; run < runs; run++) {
+          const count = this.readFarByte(segment, pointer);
+          pointer = (pointer + 1) & 0xffff;
+          if ((run & 1) === 0) {
+            for (let index = 0; index < count; index++) {
+              const offset = (readWord(readWord(0x563a) + vertical * 2) + (horizontal >>> 1)) & 0xffff;
+              const mask = horizontal & 1 ? 0x0f : 0xf0;
+              const frameSegment = readWord(0x5648);
+              const value = (this.readFarByte(frameSegment, offset) & ~mask) | (this.memory[0x55f2] & mask);
+              this.writePhysicalByte((frameSegment << 4) + offset, value);
+              horizontal = (horizontal + 1) & 0xffff;
+              if (horizontal === end) { horizontal = left; vertical = (vertical - 1) & 0xffff; }
+            }
+          } else {
+            horizontal = (horizontal + count) & 0xffff;
+            if (count !== 0 && toSignedCell((horizontal - end) & 0xffff) >= 0) {
+              horizontal = (horizontal - width) & 0xffff;
+              vertical = (vertical - 1) & 0xffff;
+            }
+          }
+        }
+        writeWord(0x561c, horizontal);
+        writeWord(0x5613, vertical);
+        return { supported: true, note: 'draw CGA run-length bitmap', output };
+      }
+      case 0xeb4a: // GAME-OV PRMSAV ( buffer -- ): save data-stack context
+      case 0xebaa: { // GAME-OV PRMSAV / RETSAV ( buffer -- ): save data/return stack context
+        if (word.module !== 'GAME-OV') break;
+        const buffer = pop(dataStack, 'data');
+        const dataContext = word.codep === 0xeb4a;
+        const base = readWord(USER_AREA + (dataContext ? 0 : 2));
+        const count = dataContext ? 1000 : 220;
+        const pointer = dataContext ? dataStack.pointer : (base - returnStack.length * 2) & 0xffff;
+        writeWord(buffer, pointer);
+        const frame = this.session!.frames.at(-1)!;
+        const next = frame.word.tokens[frame.tokenIndex]?.addr;
+        if (next === undefined) throw new Error('Stack save has no continuation');
+        writeWord(dataStack.pointer - 2, next);
+        writeWord(dataStack.pointer - 4, USER_AREA);
+        for (let index = 0; index < count; index++) this.memory[(buffer + 2 + index) & 0xffff] = this.memory[(base - count + index) & 0xffff];
+        return { supported: true, note: dataContext ? 'save data-stack context' : 'save return-stack context', output };
+      }
+      case 0xeb72: { // GAME-OV PRMLOD ( buffer -- ): restore data-stack context
+        if (word.module !== 'GAME-OV') break;
+        const buffer = pop(dataStack, 'data');
+        const pointer = readWord(buffer);
+        const frame = this.session!.frames.at(-1)!;
+        const next = frame.word.tokens[frame.tokenIndex]?.addr;
+        if (next === undefined) throw new Error('Stack restore has no continuation');
+        const returnPointer = (readWord(USER_AREA + 2) - returnStack.length * 2) & 0xffff;
+        writeWord(returnPointer - 2, next);
+        writeWord(returnPointer - 4, USER_AREA);
+        const base = readWord(USER_AREA);
+        for (let index = 0; index < 1000; index++) this.memory[(base - 1000 + index) & 0xffff] = this.memory[(buffer + 2 + index) & 0xffff];
+        dataStack.pointer = (pointer + readWord(0xde72)) & 0xffff;
+        return { supported: true, note: 'restore data-stack context', output };
+      }
+      case 0xebd2: { // GAME-OV RETJMP ( buffer -- ): restore return-stack context and resume its thread
+        if (word.module !== 'GAME-OV') break;
+        const buffer = pop(dataStack, 'data');
+        const pointer = readWord(buffer);
+        const base = readWord(USER_AREA + 2);
+        writeWord(dataStack.pointer - 2, USER_AREA);
+        for (let index = 0; index < 220; index++) this.memory[(base - 220 + index) & 0xffff] = this.memory[(buffer + 2 + index) & 0xffff];
+        const resumedPointer = (pointer + readWord(0xde6e)) & 0xffff;
+        const address = readWord(resumedPointer);
+        const depth = ((base - resumedPointer - 2) & 0xffff) >>> 1;
+        if (depth > 0x800) throw new RangeError('Invalid restored return-stack pointer');
+        returnStack.length = depth;
+        this.resumeThread(address);
+        return { supported: true, note: 'restore return-stack context', output };
+      }
+      case 0x910f: { // L@PIXEL ( x y -- color ): read the pixel pair from all four EGA planes
+        const y = pop(dataStack, 'data');
+        const x = pop(dataStack, 'data');
+        const offset = (readWord(readWord(0x563a) + y * 2) + (x >>> 2)) & 0xffff;
+        const mask = readWord(0x92cf + (x & 3) * 2);
+        this.ega.out(0x3ce, 7);
+        this.ega.out(0x3cf, 15);
+        this.ega.out(0x3ce, 5);
+        this.ega.out(0x3cf, 0);
+        let color = 0;
+        for (let plane = 0; plane < 4; plane++) {
+          this.ega.out(0x3ce, 4);
+          this.ega.out(0x3cf, plane);
+          if (this.readFarByte(readWord(0x5648), offset) & mask) color |= 1 << plane;
+        }
+        push(dataStack, color);
+        return { supported: true, note: 'read EGA pixel pair', output };
+      }
+      case 0x9097: // SQLPLOT ( x y -- ): plot a pixel pair on two adjacent rows
+      case 0x9017: { // SQLPLOT / LXPLOT ( x y -- ): plot two rows or XOR a pixel pair
+        const y = pop(dataStack, 'data');
+        const x = pop(dataStack, 'data');
+        this.ega.out(0x3ce, 1);
+        this.ega.out(0x3cf, 15);
+        if (word.codep === 0x9017) {
+          this.ega.out(0x3ce, 3);
+          this.ega.out(0x3cf, 0x18);
+        }
+        this.ega.out(0x3ce, 0);
+        this.ega.out(0x3cf, this.memory[0x55f2]);
+        this.plotEga(x, y);
+        if (word.codep === 0x9097) this.plotEga(x, (y + 1) & 0xffff);
+        else {
+          this.ega.out(0x3ce, 3);
+          this.ega.out(0x3cf, 0);
+        }
+        this.ega.out(0x3ce, 8);
+        this.ega.out(0x3cf, 0xff);
+        return { supported: true, note: word.codep === 0x9017 ? 'XOR EGA pixel pair' : 'plot two EGA rows', output };
+      }
+      case 0x9081: { // TILEFILL ( x bottom height width -- ): fill an aligned terrain tile
+        const width = pop(dataStack, 'data');
+        const height = pop(dataStack, 'data');
+        const bottom = pop(dataStack, 'data');
+        const x = pop(dataStack, 'data');
+        if (height === 0) throw new RangeError('TILEFILL requires a nonzero height');
+        const originalColor = readWord(0x55f2);
+        writeWord(0x55f2, readWord(readWord(0x58cd)));
+        this.ega.out(0x3ce, 1);
+        this.ega.out(0x3cf, 15);
+        this.ega.out(0x3ce, 0);
+        this.ega.out(0x3cf, this.memory[0x55f2]);
+        const top = (bottom - height + 1) & 0xffff;
+        for (let row = 0; row < height; row++) {
+          const y = (top + row) & 0xffff;
+          if (width === 8) {
+            const offset = (readWord(readWord(0x563a) + y * 2) + (x >>> 2)) & 0xffff;
+            this.ega.out(0x3ce, 8);
+            this.ega.out(0x3cf, 0xff);
+            writeFarWord(readWord(0x5648), offset, 0x00ff);
+          } else {
+            const left = x & 0xfe;
+            this.hlineEga(left, (left + width - 1) & 0xffff, y, readWord, writeWord);
+          }
+        }
+        if (width !== 8) writeWord(0x57ce, bottom + 1);
+        else writeWord(0x57ce, top);
+        writeWord(0x55f2, originalColor);
+        return { supported: true, note: 'fill terrain tile', output };
+      }
+      case 0x90c3: { // EEXTENT ( -- left bottom right top ): compute scaled arc bounds
+        const radius = readWord(0x5a79);
+        const horizontal = this.scaleArc(radius, readWord);
+        push(dataStack, readWord(0x5a65) - horizontal);
+        push(dataStack, readWord(0x5a6e) - radius);
+        push(dataStack, readWord(0x5a65) + horizontal);
+        push(dataStack, readWord(0x5a6e) + radius);
+        return { supported: true, note: 'arc extents', output };
+      }
+      case 0x90f9: // ARC ( -- ): draw points or build scanlines using the selected arc helper
+        this.drawArc(readWord, writeWord);
+        return { supported: true, note: 'draw arc', output };
+      case 0x8783: // CLIPPER ( -- ): clip the configured polygon using the cached side table
+        this.clipPolygon(readWord, writeWord);
+        return { supported: true, note: 'clip polygon', output };
+      case 0x16a3: { // GO ( address -- ): terminate, restart the COM bootstrap, or call a translated entry point
+        const address = pop(dataStack, 'data');
+        if (address === 0) {
+          this.session!.frames.length = 0;
+          return { supported: true, note: 'DOS program return', output };
+        }
+        if (address === 0x100) {
+          const entry = this.engine.get(readWord(0x0129), 'KERNEL');
+          if (!entry || entry.codep !== CODE_CALL) throw new Error('COM bootstrap entry is not a known Forth definition');
+          dataStack.pointer = (readWord(0x0705) + 0x100) & 0xffff;
+          returnStack.length = 0;
+          this.session!.frames.splice(0, this.session!.frames.length, { word: entry, tokenIndex: 0 });
+          return { supported: true, note: 'restart Forth bootstrap', output };
+        }
+        const target = this.translatedCodeEntry(address, word.module);
+        if (!target || target.codep === word.codep) return { supported: false, note: 'unknown machine-code target', output, stop: `GO target 0x${address.toString(16)} has no TypeScript translation.` };
+        return this.executePrimitive(target, dataStack, returnStack, output, push, pop, readWord, writeWord, readFarWord, writeFarWord);
+      }
+      case 0x1536: { // (>CODE): run a known translated inline entry, skipping its machine-code payload
+        const frame = this.session!.frames.at(-1)!;
+        const next = frame.word.tokens[frame.tokenIndex]?.addr;
+        if (next === undefined) throw new Error('(>CODE) has no inline payload');
+        const entry = (next + 2) & 0xffff;
+        const target = this.translatedCodeEntry(entry, word.module);
+        if (!target || target.codep === word.codep) return { supported: false, note: 'unknown inline code', output, stop: `(>CODE) block at 0x${entry.toString(16)} has no TypeScript translation.` };
+        this.resumeThread((entry + readWord(next)) & 0xffff);
+        return this.executePrimitive(target, dataStack, returnStack, output, push, pop, readWord, writeWord, readFarWord, writeFarWord);
+      }
+      case 0x1548: { // (;VIA): resume the thread after the inline target's code field
+        const frame = this.session!.frames.at(-1)!;
+        const next = frame.word.tokens[frame.tokenIndex]?.addr;
+        if (next === undefined) throw new Error('(;VIA) has no inline target');
+        this.resumeThread((readWord(next) + 2) & 0xffff);
+        return { supported: true, note: 'redirect threaded continuation', output };
+      }
+      case 0x1772: { // SYSCALL ( function argument -- result ): DOS CALL 5 through the existing DOS services
+        const argument = pop(dataStack, 'data');
+        const service = pop(dataStack, 'data') & 0xff;
+        if (service === 0) {
+          this.session!.frames.length = 0;
+          return { supported: true, note: 'DOS process termination', output };
+        }
+        if (service === 2 || service === 6) {
+          const character = argument & 0xff;
+          if (service === 6 && character === 0xff) push(dataStack, (this.keyQueue.shift() ?? 0) & 0xff);
+          else { output += CP437[character]; push(dataStack, character); }
+          return { supported: true, note: 'DOS console character', output };
+        }
+        if (service === 9) {
+          let terminated = false;
+          for (let index = 0; index < 0x10000; index++) {
+            const character = this.memory[(argument + index) & 0xffff];
+            if (character === 0x24) { terminated = true; break; }
+            output += CP437[character];
+          }
+          if (!terminated) throw new Error('Unterminated DOS console string');
+          push(dataStack, 0x24);
+          return { supported: true, note: 'DOS console string', output };
+        }
+        const cells = [0x16b6, 0x16bc, 0x16c0, 0x16c4];
+        const saved = cells.map(readWord);
+        try {
+          writeWord(0x16b6, (service << 8) | (word.cfa & 0xff));
+          writeWord(0x16bc, argument);
+          writeWord(0x16c0, argument);
+          writeWord(0x16c4, 0x0192);
+          push(dataStack, 0x21);
+          const result = this.executePrimitive({ ...word, name: 'INTERRUPT', codep: 0 }, dataStack, returnStack, output, push, pop, readWord, writeWord, readFarWord, writeFarWord);
+          if (result.supported) push(dataStack, readWord(0x16b6) & 0xff);
+          return { ...result, note: `DOS CALL 5 service 0x${service.toString(16)}` };
+        } finally {
+          cells.forEach((address, index) => writeWord(address, saved[index]));
+        }
+      }
+      case 0x14bd: { // DIGIT ( char base -- digit flag | 0 ): convert a character using the low-byte base
+        const base = pop(dataStack, 'data') & 0xff;
+        const character = pop(dataStack, 'data');
+        let digit = (character & 0xff) - 0x30;
+        if (digit > 9) digit -= 7;
+        const valid = digit >= 0 && digit < base && ((character & 0xff) <= 0x39 || digit >= 10);
+        if (valid) push(dataStack, digit);
+        push(dataStack, valid ? (character & 0xff00) | 1 : 0);
+        return { supported: true, note: 'convert digit', output };
+      }
+      case 0x4c87: { // (SLIPPE ( n -- n mask | 0 ): test the 256-bit sliding bitmap
+        const value = pop(dataStack, 'data');
+        const relative = (value - readWord(0x4c57) + 0x80) & 0xffff;
+        const mask = relative < 256 ? (readWord(0x4c4c) >>> (relative & 7)) & this.memory[0x4c5b + (relative >>> 3)] : 0;
+        if (mask !== 0) push(dataStack, value);
+        push(dataStack, mask);
+        return { supported: true, note: 'sliding bitmap lookup', output };
+      }
+      case 0x9a82: // headerless @IB ( segment -- value ): fetch the current icon's unsigned byte field
+        push(dataStack, this.readFarByte(pop(dataStack, 'data'), readWord(0x5a02)));
+        return { supported: true, note: 'read icon byte', output };
+      case 0x9a6c: // @IW ( segment -- value ): fetch the current icon's word field
+        push(dataStack, readFarWord(pop(dataStack, 'data'), (readWord(0x5a02) << 1) & 0xffff));
+        return { supported: true, note: 'read icon word', output };
+      case 0x992d: { // ?INVIS ( x y -- flag ): true inside the inclusive world viewport
+        const y = pop(dataStack, 'data');
+        const x = pop(dataStack, 'data');
+        const inside = !((y - readWord(0x5b31)) & 0x8000) && toSignedCell(y) <= toSignedCell(readWord(0x5b22))
+          && !((x - readWord(0x5b3c)) & 0x8000) && toSignedCell(x) <= toSignedCell(readWord(0x5b26));
+        push(dataStack, inside ? 1 : 0);
+        return { supported: true, note: 'world viewport inclusion', output };
+      }
+      case 0x9970: { // WLD>SCR ( x y -- x' y' ): signed coordinate scaling into the viewport
+        const scale = (coordinate: number, origin: number, ratio: number, destination: number) => {
+          const divisor = toSignedCell(readWord(ratio + 2));
+          const quotient = Math.trunc(toSignedCell((coordinate - readWord(origin)) & 0xffff) * toSignedCell(readWord(ratio)) / divisor);
+          if (!Number.isFinite(quotient) || quotient < -0x8000 || quotient > 0x7fff) throw new RangeError('WLD>SCR divide overflow (INT 0)');
+          return (quotient + readWord(destination)) & 0xffff;
+        };
+        const y = scale(pop(dataStack, 'data'), 0x5b31, 0x6221, 0x596b);
+        writeWord(0x48c6, y);
+        const x = scale(pop(dataStack, 'data'), 0x5b3c, 0x6211, 0x595d);
+        push(dataStack, x);
+        push(dataStack, y);
+        return { supported: true, note: 'world to screen coordinates', output };
+      }
+      case 0x99b4: { // SCR>BLT ( x y -- x' y' ): offset the icon's blit origin
+        const y = pop(dataStack, 'data');
+        const x = pop(dataStack, 'data');
+        push(dataStack, x - readWord(0x5a4e));
+        push(dataStack, y + 7 - readWord(0x5a4e));
+        return { supported: true, note: 'screen to blit coordinates', output };
+      }
+      case 0x39ee: { // MATCH ( text length pattern pattern-length -- flag offset ): scan forward, returning the last compared offset
+        const patternLength = pop(dataStack, 'data');
+        const pattern = pop(dataStack, 'data');
+        let remaining = pop(dataStack, 'data');
+        const text = pop(dataStack, 'data');
+        let cursor = text, residue = text;
+        if (patternLength === 0) throw new RangeError('MATCH requires a nonempty pattern');
+        while (remaining >= patternLength) {
+          residue = patternLength;
+          let equal = false;
+          do {
+            equal = this.memory[(pattern + patternLength - residue) & 0xffff] === this.memory[cursor & 0xffff];
+            cursor = (cursor + 1) & 0xffff;
+            residue--;
+          } while (equal && residue !== 0);
+          if (equal) { remaining = 0xffff; break; }
+          remaining = (remaining - patternLength + residue) & 0xffff;
+          if (remaining === 0) { residue = 0x0192; break; }
+        }
+        push(dataStack, residue === 0 ? 1 : 0);
+        push(dataStack, remaining + cursor - text);
+        return { supported: true, note: 'match byte pattern', output };
+      }
+      case 0x0c71: { // C!L ( value offset bank -- ): store a byte in a 64K bank
+        const segment = (pop(dataStack, 'data') & 15) << 12;
+        const offset = pop(dataStack, 'data');
+        this.writePhysicalByte((segment << 4) + offset, pop(dataStack, 'data'));
+        return { supported: true, note: 'store banked byte', output };
+      }
+      case 0x0ca7: { // C@L ( offset bank -- value ): fetch a byte from a 64K bank
+        const segment = (pop(dataStack, 'data') & 15) << 12;
+        push(dataStack, this.readFarByte(segment, pop(dataStack, 'data')));
+        return { supported: true, note: 'read banked byte', output };
+      }
+      case 0x49f0: { // L+-@ ( segment offset -- value ): sign-extend a far byte
+        const offset = pop(dataStack, 'data');
+        const value = this.readFarByte(pop(dataStack, 'data'), offset);
+        push(dataStack, (value << 24) >> 24);
+        return { supported: true, note: 'read signed far byte', output };
+      }
+      case 0x4bd9: { // L1.5@ ( segment offset -- low high ): fetch a far cell and trailing byte
+        const offset = pop(dataStack, 'data');
+        const segment = pop(dataStack, 'data');
+        push(dataStack, readFarWord(segment, offset));
+        push(dataStack, this.readFarByte(segment, (offset + 2) & 0xffff));
+        return { supported: true, note: 'read far cell and byte', output };
+      }
+      case 0x0ce4: { // CMOVE> ( source destination count -- ): copy bytes backward
+        const count = pop(dataStack, 'data');
+        const destination = pop(dataStack, 'data');
+        const source = pop(dataStack, 'data');
+        for (let index = count - 1; index >= 0; index--) this.memory[(destination + index) & 0xffff] = this.memory[(source + index) & 0xffff];
+        return { supported: true, note: 'backward near byte copy', output };
+      }
+      case 0x48dc: { // <LCMOVE ( source-segment source-offset destination-segment destination-offset count -- )
+        const count = pop(dataStack, 'data');
+        const destination = pop(dataStack, 'data');
+        const destinationSegment = pop(dataStack, 'data');
+        const source = pop(dataStack, 'data');
+        const sourceSegment = pop(dataStack, 'data');
+        for (let index = count - 1; index >= 0; index--) {
+          this.writePhysicalByte((destinationSegment << 4) + ((destination + index) & 0xffff), this.readFarByte(sourceSegment, (source + index) & 0xffff));
+        }
+        return { supported: true, note: 'backward far byte copy', output };
+      }
+      case 0x29e1: // V@ ( offset -- char ): read the character byte in VIDEOMEM
+        push(dataStack, this.readFarByte(readWord(USER_AREA + 0x18), pop(dataStack, 'data')));
+        return { supported: true, note: 'read video character', output };
+      case 0x2a18: { // VFILL ( offset count value -- ): fill video cells
+        const value = pop(dataStack, 'data');
+        const count = pop(dataStack, 'data');
+        const offset = pop(dataStack, 'data');
+        for (let index = 0; index < count; index++) writeFarWord(readWord(USER_AREA + 0x18), offset + index * 2, value);
+        return { supported: true, note: 'fill video cells', output };
+      }
+      case 0x2a36: // VMOVE ( source destination count -- ): copy video cells forward
+      case 0x2a5f: { // VMOVE / VMOVE- ( source destination count -- ): copy video cells forward/backward
+        const count = pop(dataStack, 'data');
+        const destination = pop(dataStack, 'data');
+        const source = pop(dataStack, 'data');
+        const segment = readWord(USER_AREA + 0x18);
+        for (let step = 0; step < count; step++) {
+          const index = word.codep === 0x2a5f ? -step : step;
+          writeFarWord(segment, destination + index * 2, readFarWord(segment, source + index * 2));
+        }
+        return { supported: true, note: 'copy video cells', output };
+      }
+      case 0x4910: { // 2^N ( n -- mask ): 8086 rotate-through-carry by CL after incrementing CX
+        const count = (pop(dataStack, 'data') + 1) & 0xffff;
+        let value = 0, carry = 1;
+        for (let index = 0; index < (count & 0xff); index++) {
+          const nextCarry = value >>> 15;
+          value = ((value << 1) | carry) & 0xffff;
+          carry = nextCarry;
+        }
+        push(dataStack, value);
+        return { supported: true, note: 'bit mask', output };
+      }
+      case 0x1047: // 4* ( n -- n' ): multiply a cell by four
+        unary(value => value << 2);
+        return { supported: true, note: 'multiply by four', output };
+      case 0x4984: // 3+ ( n -- n' ): add three with cell wrapping
+        unary(value => value + 3);
+        return { supported: true, note: 'add three', output };
+      case 0x1355: { // TOGGLE ( addr mask -- ): XOR the low byte of mask into memory
+        const mask = pop(dataStack, 'data');
+        const address = pop(dataStack, 'data');
+        this.memory[address] ^= mask & 0xff;
+        return { supported: true, note: 'toggle byte bits', output };
+      }
+      case 0x0bbf: { // @L ( offset bank -- value ): bank's low nibble selects a 64K physical bank
+        const segment = (pop(dataStack, 'data') & 0x0f) << 12;
+        push(dataStack, readFarWord(segment, pop(dataStack, 'data')));
+        return { supported: true, note: 'read banked word', output };
+      }
+      case 0x0bf1: { // !L ( value offset bank -- ): store a word in a 64K physical bank
+        const segment = (pop(dataStack, 'data') & 0x0f) << 12;
+        const offset = pop(dataStack, 'data');
+        writeFarWord(segment, offset, pop(dataStack, 'data'));
+        return { supported: true, note: 'store banked word', output };
+      }
+      case 0x9eb1: { // ?IID ( lower upper start count -- indices... matches ): find icon IDs between exclusive bounds
+        const count = pop(dataStack, 'data');
+        writeWord(0x5b04, pop(dataStack, 'data'));
+        const upper = pop(dataStack, 'data');
+        writeWord(0x48c8, pop(dataStack, 'data'));
+        const segment = readWord(0x59c6);
+        let matches = 0;
+        push(dataStack, matches);
+        for (let remaining = toSignedCell(count); remaining > 0; remaining--) {
+          const index = (remaining - 1 + readWord(0x5b04)) & 0xffff;
+          const id = this.readFarByte(segment, index);
+          if (toSignedCell((id - upper) & 0xffff) < 0 && id > toSignedCell(readWord(0x48c8))) {
+            pop(dataStack, 'data');
+            push(dataStack, index);
+            push(dataStack, ++matches);
+          }
+        }
+        return { supported: true, note: `icon ID matches: ${matches}`, output };
+      }
+      case 0x9e14: { // XCHGICON ( first second -- ): swap three byte fields and three word fields of two icons
+        const second = pop(dataStack, 'data');
+        const first = pop(dataStack, 'data');
+        for (const segmentCell of [0x59c6, 0x59ca, 0x59da]) {
+          const segment = readWord(segmentCell);
+          const firstValue = this.readFarByte(segment, first);
+          const secondValue = this.readFarByte(segment, second);
+          this.writePhysicalByte((segment << 4) + second, firstValue);
+          this.writePhysicalByte((segment << 4) + first, secondValue);
+        }
+        const firstOffset = (first << 1) & 0xffff;
+        const secondOffset = (second << 1) & 0xffff;
+        for (const segmentCell of [0x59be, 0x59c2, 0x59ce]) {
+          const segment = readWord(segmentCell);
+          const firstValue = readFarWord(segment, firstOffset);
+          const secondValue = readFarWord(segment, secondOffset);
+          writeFarWord(segment, secondOffset, firstValue);
+          writeFarWord(segment, firstOffset, secondValue);
+        }
+        return { supported: true, note: `swap icons ${first} and ${second}`, output };
+      }
+      case 0x9d18: { // ?ILOCUS ( x y radius start count -- indices... matches ): find icons within a square locus
+        const count = pop(dataStack, 'data');
+        writeWord(0x5b04, pop(dataStack, 'data'));
+        writeWord(0x5b00, pop(dataStack, 'data'));
+        writeWord(0x5afc, pop(dataStack, 'data'));
+        writeWord(0x5af8, pop(dataStack, 'data'));
+        let matches = 0;
+        push(dataStack, matches);
+        for (let remaining = toSignedCell(count); remaining > 0; remaining--) {
+          const offset = ((remaining - 1 + readWord(0x5b04)) << 1) & 0xffff;
+          let inside = true;
+          for (const [segmentCell, centerCell] of [[0x59be, 0x5af8], [0x59c2, 0x5afc]]) {
+            const difference = toSignedCell((readFarWord(readWord(segmentCell), offset) - readWord(centerCell)) & 0xffff);
+            if (toSignedCell(Math.abs(difference)) > toSignedCell(readWord(0x5b00))) {
+              inside = false;
+              break;
+            }
+          }
+          if (inside) {
+            pop(dataStack, 'data');
+            push(dataStack, offset >>> 1);
+            push(dataStack, ++matches);
+          }
+        }
+        return { supported: true, note: `icon locus matches: ${matches}`, output };
+      }
+      case 0x4b08: { // D2* ( low high -- low' high' ): shift a double cell left, carrying from low to high
+        const high = pop(dataStack, 'data');
+        const low = pop(dataStack, 'data');
+        push(dataStack, low << 1);
+        push(dataStack, (high << 1) | (low >>> 15));
+        return { supported: true, note: 'double-cell left shift', output };
+      }
+      case 0x4b17: { // EASY-BITS ( low high trial count -- low' high' trial' ): iterative square-root steps
+        const count = pop(dataStack, 'data') || 0x10000;
+        let trial = pop(dataStack, 'data');
+        let high = pop(dataStack, 'data');
+        let low = pop(dataStack, 'data');
+        for (let iteration = 0; iteration < count; iteration++) {
+          high = ((high << 2) | (low >>> 14)) & 0xffff;
+          low = (low << 2) & 0xffff;
+          const difference = (high - trial) & 0xffff;
+          if ((difference & 0x8000) !== 0) {
+            trial = ((trial << 1) - 1) & 0xffff;
+          } else {
+            high = difference;
+            trial = (((trial + 1) << 1) + 1) & 0xffff;
+          }
+        }
+        push(dataStack, low);
+        push(dataStack, high);
+        push(dataStack, trial);
+        return { supported: true, note: `square-root steps: ${count}`, output };
+      }
+      case 0x9a9e: { // !IW ( value segment -- ): store a word at twice the current icon index
+        const segment = pop(dataStack, 'data');
+        const value = pop(dataStack, 'data');
+        writeFarWord(segment, (readWord(0x5a02) << 1) & 0xffff, value);
+        return { supported: true, note: 'store icon word', output };
+      }
+      case 0x9aba: { // !IB ( value segment -- ): store a byte at the current icon index
+        const segment = pop(dataStack, 'data');
+        const value = pop(dataStack, 'data');
+        this.writePhysicalByte((segment << 4) + readWord(0x5a02), value);
+        return { supported: true, note: 'store icon byte', output };
+      }
+      case 0x4d5c: { // headerless 2D-array lookup ( column row descriptor -- segment offset )
+        const descriptor = pop(dataStack, 'data');
+        const table = readWord(descriptor + 4);
+        const segment = readWord(descriptor + 6);
+        const row = pop(dataStack, 'data');
+        const column = pop(dataStack, 'data');
+        const offset = readFarWord(segment, table + row * 2);
+        push(dataStack, segment);
+        push(dataStack, offset + column);
+        return { supported: true, note: '2D-array element address', output };
+      }
+      case 0x4af3: { // +BIT ( value -- count ): count set bits in a 16-bit cell
+        let value = pop(dataStack, 'data');
+        let count = 0;
+        for (let bit = 0; bit < 16; bit++) {
+          count += value & 1;
+          value >>>= 1;
+        }
+        push(dataStack, count);
+        return { supported: true, note: 'count set bits', output };
+      }
+      case 0x718d: { // RECADD ( record-index record-size offset block -- offset' block' )
+        let block = pop(dataStack, 'data');
+        let offset = pop(dataStack, 'data');
+        const recordSize = pop(dataStack, 'data');
+        let recordIndex = pop(dataStack, 'data');
+        if (recordSize === 0) throw new RangeError('RECADD division by zero');
+        const remainingRecords = Math.floor(((0x400 - offset) & 0xffff) / recordSize);
+        if (toSignedCell(remainingRecords) > toSignedCell(recordIndex)) {
+          offset += recordIndex * recordSize;
+        } else {
+          recordIndex = (recordIndex - remainingRecords) & 0xffff;
+          const recordsPerBlock = Math.floor(0x400 / recordSize);
+          if (recordsPerBlock === 0) throw new RangeError('RECADD division by zero');
+          block += 1 + Math.floor(recordIndex / recordsPerBlock);
+          offset = (recordIndex % recordsPerBlock) * recordSize;
+        }
+        push(dataStack, offset);
+        push(dataStack, block);
+        return { supported: true, note: 'record block and offset', output };
+      }
       case 0x3048: { // (BUFFER)
         const block = pop(dataStack, 'data');
         let segment = readWord(0x2c84); // PREV
@@ -1173,6 +1977,15 @@ export class ForthBootRunner {
         }
         return { supported: true, note: `fill ${count} bytes at ${segment.toString(16)}:0 with color ${color}`, output };
       }
+      case 0x90ad: { // V>DISPLAY ( -- ): copy the packed main view to the display, 120 rows of 18 bytes
+        const sourceSegment = readWord(0x55d8);
+        const destinationSegment = readWord(0x55e6);
+        for (let row = 0; row < 120; row++) {
+          const destinationOffset = (readWord(0x6598 + row * 2) + 1) & 0xffff;
+          this.latchCopy(sourceSegment, row * 18, destinationSegment, destinationOffset, 18);
+        }
+        return { supported: true, note: 'copy main view to display', output };
+      }
       case 0x8e4f: { // headerless EGA page copy ( src-seg src-off dst-seg dst-off -- ): 2000h bytes in write mode 1
         const destinationOffset = pop(dataStack, 'data');
         const destinationSegment = pop(dataStack, 'data');
@@ -1296,12 +2109,18 @@ export class ForthBootRunner {
       case 0x8891: // SCANPOLY ( -- ): build the SCAN table for the polygon at VIN
         this.scanPolygon(readWord, writeWord);
         return { supported: true, note: `scan polygon of ${readWord(0x5686)} vertices: y ${toSignedCell(readWord(0x57ec))}..${toSignedCell(readWord(0x57f7))}`, output };
+      case 0x9002: // LPLOT ( x y -- ): enable Set/Reset on all planes, then plot as below
       case 0x9367: { // PLOT ( x y -- ): set a 2-pixel-wide EGA pixel at (x, y) of the 160x200 grid to COLOR
         const y = pop(dataStack, 'data');
         const x = pop(dataStack, 'data');
+        if (word.codep === 0x9002) {
+          this.ega.out(0x3ce, 1);
+          this.ega.out(0x3cf, 0x0f);
+        }
         this.ega.out(0x3ce, 0); // Set/Reset = COLOR
         this.ega.out(0x3cf, this.memory[0x55f2]);
         this.plotEga(x, y);
+        if (word.codep === 0x9002) this.ega.out(0x3ce, 0);
         return { supported: true, note: `plot ${x},${y} color ${this.memory[0x55f2]}`, output };
       }
       case 0xf379: { // BLT-OV .EGARUNBIT ( seg off -- ): draw a run-length bitmap at XBLT,YBLT, WBLT wide, in COLOR
@@ -1647,7 +2466,16 @@ export class ForthBootRunner {
         const divisor = pop(dataStack, 'data');
         const high = pop(dataStack, 'data');
         const low = pop(dataStack, 'data');
-        if (divisor === 0) throw new RangeError('Forth U/MOD division by zero');
+        if (divisor === 0 || high >= divisor) {
+          const handler = readFarWord(0, 0);
+          const segment = readFarWord(0, 2);
+          if (segment !== 0x0192 || ![0x01c4, 0x01c7, 0x01d1].includes(handler)) {
+            throw new RangeError(divisor === 0 ? 'Forth U/MOD division by zero' : 'Forth U/MOD quotient overflow (INT 0)');
+          }
+          push(dataStack, 0);
+          push(dataStack, 0);
+          return { supported: true, note: 'unsigned divide fault recovered by SET0/: zero remainder and quotient', output };
+        }
         const dividend = low + high * 0x10000;
         push(dataStack, dividend % divisor);
         push(dataStack, Math.floor(dividend / divisor));
@@ -1743,10 +2571,10 @@ export class ForthBootRunner {
       case 'ADDR>SEG':
         push(dataStack, (pop(dataStack, 'data') >>> 4) + 0x0192);
         return { supported: true, note: 'convert real-mode address to segment', output };
-      case 'SET0/':
-        writeFarWord(0, 0, 0x01d1);
+      case 'SET0/': // The CPU-detection probe selects the 8086 recovery handler at 01C7h.
+        writeFarWord(0, 0, 0x01c7);
         writeFarWord(0, 2, 0x0192);
-        return { supported: true, note: 'install divide-by-zero IVT handler', output };
+        return { supported: true, note: 'install divide-error recovery IVT handler', output };
       case 'INTERRUPT': {
         const interrupt = pop(dataStack, 'data') & 0xff;
         const ax = readWord(0x16b6);
@@ -2003,8 +2831,26 @@ export class ForthBootRunner {
         return { supported: true, note: 'swap', output };
       }
       default:
-        return { supported: false, note: 'native primitive', output };
+        return { supported: false, note: 'native primitive without a TypeScript handler', output };
     }
+  }
+
+  private translatedCodeEntry(address: number, module: string): ForthWord | undefined {
+    const candidates = this.engine.words.filter(candidate => candidate.type === 'primitive' && candidate.codep === address && candidate.codep !== CODE_USER_VECTOR);
+    return candidates.find(candidate => candidate.module === module) ?? candidates.find(candidate => candidate.module === 'KERNEL');
+  }
+
+  private resumeThread(address: number): void {
+    const frames = this.session!.frames;
+    for (let depth = frames.length - 1; depth >= 0; depth--) {
+      const frame = frames[depth];
+      const index = frame.word.tokens.findIndex(token => token.addr === address);
+      if (index < 0) continue;
+      frames.length = depth + 1;
+      frame.tokenIndex = index;
+      return;
+    }
+    throw new Error(`Unindexed thread continuation 0x${address.toString(16)}`);
   }
 
   private formatTrace(steps: number, word: ForthWord, token: ForthToken, stack: MemoryStack, note: string): string {
@@ -2126,9 +2972,153 @@ export class ForthBootRunner {
     this.writePhysicalByte(address, this.readPhysicalByte(address));
   }
 
-  // The EGA driver's horizontal line (REMSEG:0487h via the far stub at 9125h): XSTART..XEND on YLINE in the
-  // Set/Reset color, skipped when XEND is right of IRIGHT or XSTART > XEND (unsigned). The original's partial-byte
-  // and rep stosb paths set the same pixels.
+  private clipPolygon(readWord: (address: number) => number, writeWord: (address: number, value: number) => void): void {
+    if (readWord(0x5686) === 0) return;
+    this.outcodeVertices(readWord, writeWord);
+    if (readWord(0x56e8) !== 0) { writeWord(0x5686, 0); return; }
+    const sides = readWord(0x56dc);
+    if (sides === 0) return;
+    const outcode = (x: number, y: number) => {
+      let code = 0;
+      if ((x - readWord(0x5738)) & 0x8000) code |= 1;
+      if (toSignedCell(x) > toSignedCell(readWord(0x5745))) code |= 2;
+      if ((y - readWord(0x5752)) & 0x8000) code |= 4;
+      if (toSignedCell(y) > toSignedCell(readWord(0x575f))) code |= 8;
+      return code;
+    };
+    for (let side = 0; side < 4; side++) {
+      const descriptor = 0x5253 + side * 5;
+      const mask = readWord(descriptor);
+      if ((mask & sides & 0xff) === 0) continue;
+      const axis = this.memory[(descriptor + 2) & 0xffff];
+      const bound = readWord(descriptor + 3);
+      writeWord(0x5728, mask);
+      writeWord(0x56cf, axis);
+      writeWord(0x572c, bound);
+      writeWord(0x5691, 0);
+      const input = readWord(0x569b), output = readWord(0x56a6);
+      const inputCodes = readWord(0x56b0), outputCodes = readWord(0x56bb);
+      const count = readWord(0x5686);
+      const open = readWord(0x56f4) === 1;
+      const vertex = (index: number) => ({
+        y: readWord(input + index * 4), x: readWord(input + index * 4 + 2),
+        code: this.memory[(inputCodes + index) & 0xffff]
+      });
+      let emitted = 0;
+      const emit = (point: { x: number; y: number; code: number }, intersection = false) => {
+        writeWord(output + emitted * 4, point.y);
+        writeWord(output + emitted * 4 + 2, point.x);
+        this.memory[(outputCodes + emitted) & 0xffff] = point.code;
+        if (intersection) this.memory[(outputCodes + emitted + 1) & 0xffff] = 0;
+        writeWord(0x5691, ++emitted);
+      };
+      let previous = vertex(open ? 0 : count - 1);
+      if (open && (previous.code & mask & 0xff) === 0) emit(previous);
+      for (let index = open ? 1 : 0; index < count; index++) {
+        const current = vertex(index);
+        writeWord(0x5708, previous.y);
+        writeWord(0x5704, previous.x);
+        this.memory[0x570c] = previous.code;
+        writeWord(0x5714, current.y);
+        writeWord(0x5710, current.x);
+        this.memory[0x5718] = current.code;
+        const previousOutside = (previous.code & (mask >>> 8)) !== 0;
+        const currentOutside = (current.code & (mask & 0xff)) !== 0;
+        const currentAxis = axis === 1 ? current.y : current.x;
+        const previousAxis = axis === 1 ? previous.y : previous.x;
+        if (previousOutside !== currentOutside && (open || (currentAxis !== bound && previousAxis !== bound))) {
+          const currentOther = axis === 1 ? current.x : current.y;
+          const previousOther = axis === 1 ? previous.x : previous.y;
+          const numerator = toSignedCell((bound - currentAxis) & 0xffff) * toSignedCell((previousOther - currentOther) & 0xffff);
+          const quotient = Math.trunc(numerator / toSignedCell((previousAxis - currentAxis) & 0xffff));
+          if (!Number.isFinite(quotient) || quotient < -0x8000 || quotient > 0x7fff) throw new RangeError('CLIPPER divide overflow (INT 0)');
+          const other = (currentOther + quotient) & 0xffff;
+          const x = axis === 1 ? other : bound, y = axis === 1 ? bound : other;
+          emit({ x, y, code: outcode(x, y) }, true);
+        }
+        if (!currentOutside) emit(current);
+        previous = current;
+      }
+      writeWord(0x5708, previous.y);
+      writeWord(0x5704, previous.x);
+      this.memory[0x570c] = previous.code;
+      writeWord(0x569b, output);
+      writeWord(0x56a6, input);
+      writeWord(0x56b0, outputCodes);
+      writeWord(0x56bb, inputCodes);
+      writeWord(0x5686, emitted);
+      if (emitted === 0) break;
+    }
+  }
+
+  private scaleArc(value: number, readWord: (address: number) => number): number {
+    const quotient = Math.trunc(toSignedCell(value) * toSignedCell(readWord(0x5a86)) / toSignedCell(readWord(0x5a93)));
+    if (!Number.isFinite(quotient) || quotient < -0x8000 || quotient > 0x7fff) throw new RangeError('Arc scaling divide overflow (INT 0)');
+    return quotient & 0xffff;
+  }
+
+  private drawArc(readWord: (address: number) => number, writeWord: (address: number, value: number) => void): void {
+    const helper = readWord(0x5aa0);
+    if (![0x0b20, 0x0b53, 0x0be7, 0x0c01].includes(helper)) throw new Error(`Unsupported arc helper 0x${helper.toString(16)}`);
+    const radius = readWord(0x5a79);
+    if (radius & 0x8000) throw new RangeError('ARC requires a nonnegative radius');
+    this.ega.out(0x3ce, 1);
+    this.ega.out(0x3cf, 15);
+    const point = (horizontal: number, vertical: number) => {
+      const x = (readWord(0x5a65) + horizontal) & 0xffff;
+      const y = (readWord(0x5a6e) + vertical) & 0xffff;
+      writeWord(readWord(0x569b), y);
+      writeWord(readWord(0x569b) + 2, x);
+      writeWord(0x5686, 1);
+      this.outcodeVertices(readWord, writeWord);
+      if (readWord(0x56dc) === 0) {
+        this.ega.out(0x3ce, 0);
+        this.ega.out(0x3cf, this.memory[0x55f2]);
+        this.plotEga(x, y);
+        this.ega.out(0x3ce, 0);
+      }
+    };
+    const quadrant = (horizontal: number, vertical: number) => {
+      const scaled = this.scaleArc(horizontal, readWord);
+      if (helper === 0x0b20 || helper === 0x0c01) {
+        point(scaled, vertical);
+        point(-scaled, vertical);
+        point(-scaled, -vertical);
+        point(scaled, -vertical);
+      } else {
+        let right = (readWord(0x5a65) + scaled) & 0xffff;
+        if (toSignedCell(right) > toSignedCell(readWord(0x5745))) right = readWord(0x5745);
+        if ((right - readWord(0x5738)) & 0x8000) right = (readWord(0x5738) - 1) & 0xffff;
+        this.memory[0x48c7] = right & 0xff;
+        let left = (readWord(0x5a65) - scaled) & 0xffff;
+        if ((left - readWord(0x5738)) & 0x8000) left = readWord(0x5738);
+        if (toSignedCell(left) > toSignedCell(readWord(0x5745))) left = (((left & 0xff00) | (right & 0xff)) + 1) & 0xffff;
+        this.memory[0x48c6] = left & 0xff;
+        for (const y of [(readWord(0x5a6e) + vertical) & 0xffff, (readWord(0x5a6e) - vertical) & 0xffff]) {
+          if (!((y - readWord(0x5752)) & 0x8000) && toSignedCell(y) <= toSignedCell(readWord(0x575f))) {
+            writeWord(readWord(0x57d9) + y * 2, (left & 0xff) | ((right & 0xff) << 8));
+          }
+        }
+      }
+    };
+    const visit = (horizontal: number, vertical: number) => {
+      quadrant(horizontal, vertical);
+      if (helper === 0x0be7 || helper === 0x0c01) quadrant(vertical, horizontal);
+    };
+    let horizontal = 0, vertical = radius;
+    let decision = (3 - radius * 2) & 0xffff;
+    while (((horizontal - vertical) & 0x8000) !== 0) {
+      visit(horizontal, vertical);
+      if (decision & 0x8000) decision = (decision + 6 + horizontal * 4) & 0xffff;
+      else {
+        decision = (decision + 10 + (horizontal - vertical) * 4) & 0xffff;
+        vertical = (vertical - 1) & 0xffff;
+      }
+      horizontal = (horizontal + 1) & 0xffff;
+    }
+    if (horizontal === vertical) visit(horizontal, vertical);
+  }
+
   private hlineEga(
     start: number,
     end: number,

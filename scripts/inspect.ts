@@ -2,7 +2,7 @@
 
 import { readFile } from 'node:fs/promises';
 import { parseArgs } from 'node:util';
-import { createForthEngine } from '../src/forth-decompiler.ts';
+import { CFA_LIT, CFA_2LIT, CFA_0BRANCH, CFA_BRANCH, CFA_EXIT1, createForthEngine, type ForthEngine, type ForthWord } from '../src/forth-decompiler.ts';
 import { BIOS_KEYS, ForthBootRunner, biosKey, screenLines, type ForthGraphicsScreen, type TimedKey } from '../src/forth-boot.ts';
 
 const usage = `Usage: npm run inspect -- <command> [options]
@@ -13,6 +13,7 @@ Commands:
   disasm <address>        Disassemble 16-bit x86 at a runtime address (kernel or --module overlay)
   dump <address>          Hex dump bytes with little-endian words and ASCII (kernel or --module overlay)
   code <address>          List words whose code pointer is the given address
+  primitives             List dictionary primitives without a statically recognized runner handler
   boot                   Print boot output, trace, and stop reason
 
 Options:
@@ -149,6 +150,55 @@ async function loadImages() {
   return { engine, stara, starb, starflt };
 }
 
+async function primitiveInventory(engine: ForthEngine, starflt: ArrayBuffer, module?: string): Promise<void> {
+  const ts = await import('typescript');
+  const source = ts.createSourceFile('forth-boot.ts', await readFile(new URL('../src/forth-boot.ts', import.meta.url), 'utf8'), ts.ScriptTarget.Latest, true);
+  const codes = new Set<number>();
+  const names = new Set(['(.\")', '(ABORT\")']);
+  const visit = (node: import('typescript').Node): void => {
+    if (ts.isSwitchStatement(node)) {
+      const expression = node.expression.getText(source);
+      for (const clause of node.caseBlock.clauses) {
+        if (!ts.isCaseClause(clause)) continue;
+        if (expression === 'word.codep' && ts.isNumericLiteral(clause.expression)) {
+          const code = Number(clause.expression.text);
+          codes.add(code);
+        }
+        if (expression === 'name' && ts.isStringLiteral(clause.expression)) names.add(clause.expression.text);
+      }
+    }
+    if (ts.isBinaryExpression(node) && node.operatorToken.kind === ts.SyntaxKind.EqualsEqualsEqualsToken
+      && node.left.getText(source) === 'target.name' && ts.isStringLiteral(node.right)) names.add(node.right.text);
+    ts.forEachChild(node, visit);
+  };
+  visit(source);
+  const kernel = new Uint8Array(0x10000);
+  kernel.set(new Uint8Array(starflt).subarray(0, 0xff00), 0x100);
+  const control = new Set([CFA_LIT, CFA_2LIT, CFA_0BRANCH, CFA_BRANCH, CFA_EXIT1]);
+  const owner = (word: ForthWord): string => {
+    const overlay = engine.overlays.get(word.module);
+    return overlay && word.codep >= overlay.storeofs && word.codep < overlay.storeofs + overlay.size ? word.module : 'KERNEL';
+  };
+  const candidates = engine.words.filter(word => word.type === 'primitive' && (module === undefined || word.module === module));
+  const unresolved = candidates.filter(word => word.typeLabel === 'Unresolved word (raw memory)');
+  const primitives = candidates.filter(word => !unresolved.includes(word));
+  const missing = primitives.filter(word => {
+    if (names.has(word.name) || word.codep === 0x17b7 || (word.module === 'KERNEL' && control.has(word.cfa))) return false;
+    if (codes.has(word.codep) && (word.codep !== 0xec7d || word.module === 'PORTMENU-OV')
+      && (word.codep !== 0xf379 || word.module === 'BLT-OV')) return false;
+    const memory = owner(word) === 'KERNEL' ? kernel : engine.overlays.get(word.module)!.memory;
+    const displacement = memory[(word.codep + 1) & 0xffff] | (memory[(word.codep + 2) & 0xffff] << 8);
+    return !(memory[word.codep] === 0xe8 && ((word.codep + 3 + displacement) & 0xffff) === 0x1649);
+  });
+  for (const word of missing) console.log(`${word.module}:${word.name}  CFA ${word.cfaHex}  code ${word.codepHex}`);
+  const entries = (words: ForthWord[]) => new Set(words.map(word => `${owner(word)}:${word.codep}`)).size;
+  console.log(`\n${missing.length} candidate word(s), ${entries(missing)} distinct native entry point(s) without a recognized handler.`);
+  console.log(`${primitives.length} dictionary primitive word(s), ${entries(primitives)} distinct native entry point(s) inspected.`);
+  console.log('Handlers are direct TypeScript translations; arbitrary GO and (>CODE) machine-code targets are not supported.');
+  for (const word of unresolved) console.log(`Unresolved dictionary metadata (not verified native code): ${word.module}:${word.name} CFA ${word.cfaHex} code ${word.codepHex}`);
+  console.log('Static inventory only: excludes user vectors, DOES> children and handled control flow; omits undiscovered headerless code and does not prove reachability or complete handler support.');
+}
+
 // A 64K segment image and the address range that holds real bytes: STARFLT.COM from 0x100, or an overlay at its
 // load address.
 interface Segment {
@@ -235,11 +285,11 @@ async function main(): Promise<void> {
   }
 
   const [command, query = ''] = positionals;
-  if (!['word', 'callers', 'boot', 'disasm', 'dump', 'code'].includes(command)) {
+  if (!['word', 'callers', 'boot', 'disasm', 'dump', 'code', 'primitives'].includes(command)) {
     throw new Error(`Unknown command '${command}'. Use --help for usage.`);
   }
-  if (positionals.length !== (command === 'boot' ? 1 : 2)) {
-    throw new Error(`${command} expects ${command === 'boot' ? 'no positional arguments' : ['disasm', 'dump', 'code'].includes(command) ? 'one runtime address' : 'one word name or CFA'}.`);
+  if (positionals.length !== (command === 'boot' || command === 'primitives' ? 1 : 2)) {
+    throw new Error(`${command} expects ${command === 'boot' || command === 'primitives' ? 'no positional arguments' : ['disasm', 'dump', 'code'].includes(command) ? 'one runtime address' : 'one word name or CFA'}.`);
   }
   const runtime = values.segment !== undefined;
   if (runtime && command !== 'dump' && command !== 'disasm') {
@@ -334,8 +384,12 @@ async function main(): Promise<void> {
     return;
   }
 
-  const { engine } = await loadImages();
+  const { engine, starflt } = await loadImages();
   if (values.module !== undefined && !engine.modules.includes(values.module)) throw new Error(`Unknown module '${values.module}'.`);
+  if (command === 'primitives') {
+    await primitiveInventory(engine, starflt, values.module);
+    return;
+  }
   if (command === 'code') {
     const matches = engine.words.filter(candidate => candidate.codep === codeAddress
       && (values.module === undefined || candidate.module === values.module));

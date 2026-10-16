@@ -21,6 +21,7 @@ npm run inspect -- --help
 npm run inspect -- word 'R/W'
 npm run inspect -- word 0x06db
 npm run inspect -- callers 'R/W'
+npm run inspect -- primitives
 npm run inspect -- disasm 0x17b7 --bytes 64 --count 8
 npm run inspect -- dump 0x07e4 --bytes 16
 npm run inspect -- dump 0xe2c0 --module MUSIC --bytes 32
@@ -95,13 +96,22 @@ npm run inspect -- boot --steps 6000000 --keys '5{Enter}' --key-at '4800000:{Arr
   calls `0x1649`), and colon definitions (`0x224c`, decoded from memory once
   per run). Both the decompiler and the runner keep decoding past an EXIT that
   a forward branch jumps over (`IF ... EXIT THEN ...`).
-  Headerless CODE runs through the code-pointer cases in `executePrimitive`, so
-  implement one there after checking it with `disasm <PFA>`.
+  Headerless CODE runs through the code-pointer cases in `executePrimitive`.
+  Inspect a failure with `disasm <PFA>`, then add a direct TypeScript handler;
+  there is no x86 interpreter or native-execution fallback. Keep an inline word
+  name and stack-effect comment on each new case. `GO` handles DOS return, the
+  known COM bootstrap, and translated primitive entry points. Arbitrary `GO`
+  targets and unrecognized `(>CODE)` blocks stop explicitly.
+- `primitives` lists dictionary entries without recognized handlers. Unresolved raw dictionary metadata is
+  listed separately, not counted as verified machine code. This is a static
+  inventory, not a guarantee that every input or device service is supported.
 - The data stack lives in emulated memory, as on the 8086: it grows down from the
   address in user cell `SP0` (`0x078c`, initially `0xf6f4`), `SP@` pushes the
   address of the top cell, and `SP!` resets to `SP0`. Words such as `PICK`
-  (`SP@ + @`) and `DEPTH` therefore work unchanged. The return stack is still a
-  JS array, so `RP@` is not supported yet.
+  (`SP@ + @`) and `DEPTH` therefore work unchanged. The return stack has an
+  array-compatible interface backed by RAM below `RP0` (`0x078e`, initially
+  `0xf7d0`), so `RP@`, translated primitives, and stores through return-stack addresses
+  observe the same cells. Checkpoints serialize its values as an ordinary array.
 - `boot` runs `ForthBootRunner`, printing output, the execution trace, and the
   stop reason. Its defaults are kernel entry CFA `0x0937` and 50,000 steps.
   `--entry` and `--steps` accept decimal or `0x`-prefixed integers.

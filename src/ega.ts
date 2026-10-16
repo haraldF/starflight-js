@@ -19,6 +19,15 @@ const BIT_MASK = 8;
 // Sequencer register (3C4h/3C5h).
 const MAP_MASK = 2;
 
+export interface EgaState {
+  planes: Uint8Array[];
+  graphics: Uint8Array;
+  sequencer: Uint8Array;
+  graphicsIndex: number;
+  sequencerIndex: number;
+  latches: Uint8Array;
+}
+
 export class EgaAdapter {
   readonly planes = [0, 1, 2, 3].map(() => new Uint8Array(0x10000));
   readonly graphics = new Uint8Array(9);
@@ -29,6 +38,28 @@ export class EgaAdapter {
 
   constructor() {
     this.resetRegisters();
+  }
+
+  saveState(): EgaState {
+    return {
+      planes: this.planes.map(plane => plane.slice()),
+      graphics: this.graphics.slice(), sequencer: this.sequencer.slice(),
+      graphicsIndex: this.graphicsIndex, sequencerIndex: this.sequencerIndex,
+      latches: this.latches.slice()
+    };
+  }
+
+  loadState(state: EgaState): void {
+    if (state.planes.length !== 4 || state.planes.some(plane => plane.length !== 0x10000)
+      || state.graphics.length !== 9 || state.sequencer.length !== 5 || state.latches.length !== 4) {
+      throw new Error('Invalid EGA checkpoint.');
+    }
+    state.planes.forEach((plane, index) => this.planes[index].set(plane));
+    this.graphics.set(state.graphics);
+    this.sequencer.set(state.sequencer);
+    this.graphicsIndex = state.graphicsIndex;
+    this.sequencerIndex = state.sequencerIndex;
+    this.latches.set(state.latches);
   }
 
   // The register state the BIOS leaves after a graphics mode set; `clear` zeroes all four planes.
@@ -47,6 +78,14 @@ export class EgaAdapter {
       if (this.sequencerIndex < this.sequencer.length) this.sequencer[this.sequencerIndex] = value;
     } else return false;
     return true;
+  }
+
+  input(port: number): number {
+    if (port === GRAPHICS_INDEX) return this.graphicsIndex;
+    if (port === GRAPHICS_DATA) return this.graphics[this.graphicsIndex] ?? 0;
+    if (port === SEQUENCER_INDEX) return this.sequencerIndex;
+    if (port === SEQUENCER_DATA) return this.sequencer[this.sequencerIndex] ?? 0;
+    return 0;
   }
 
   // A CPU read loads all four latches; read mode 0 returns one plane, read mode 1 a color-compare mask.

@@ -8,6 +8,7 @@ import { createForthEngine, type ForthEngine } from './forth-decompiler';
 import { ForthExplorer } from './forth-explorer';
 import { KernelDisassembler } from './kernel-disassembler';
 import { SpeakerAudio } from './speaker-audio';
+import { SAVE_FILE_EXTENSION, decodeSaveFile, encodeSaveFile, saveFileName } from './save-file';
 import { fetchGameFiles, hasAllGameFiles, loadCachedGameFiles, showGameFilesPage, type GameFiles } from './game-files';
 import {
   CP437,
@@ -507,8 +508,12 @@ class GameScreen {
   // Aborted on unmount: removes this mount's document listeners.
   private mounted?: AbortController;
 
+  // STARFLT.COM, which save files name so they only load with the same game program.
+  private readonly starflt: Uint8Array;
+
   constructor(forthEngine: ForthEngine, starflt: Uint8Array, fs: StarflightFS) {
     this.runner = new ForthBootRunner(forthEngine, starflt, fs);
+    this.starflt = starflt;
   }
 
   // Add MU to the running game's bank account; false when no game is running.
@@ -575,6 +580,14 @@ class GameScreen {
             <button id="run-forth-boot" class="btn" type="button">Run Forth Boot</button>
             <button id="save-game" class="btn" type="button" disabled>Save</button>
             <button id="load-game" class="btn" type="button">Load</button>
+            <div class="save-files">
+              <button id="save-files-button" class="btn" type="button" aria-haspopup="menu" aria-expanded="false" aria-controls="save-files-menu">Save files &#9662;</button>
+              <div id="save-files-menu" class="save-files-menu" role="menu" aria-labelledby="save-files-button" hidden>
+                <button id="download-save" type="button" role="menuitem">Download save file</button>
+                <button id="upload-save" type="button" role="menuitem">Upload save file&hellip;</button>
+              </div>
+              <input id="upload-save-input" type="file" accept="${SAVE_FILE_EXTENSION},application/gzip,application/json" hidden>
+            </div>
             <button id="full-screen" class="btn" type="button">Full screen</button>
             <label><input id="auto-ega" type="checkbox" checked> Auto-select EGA</label>
             <label><input id="skip-intro" type="checkbox"> Skip intro</label>
@@ -693,45 +706,111 @@ class GameScreen {
       checkpointStatus.textContent = '';
       resume('running');
     };
-    const persist = async (saving: boolean) => {
+    // The whole game for a checkpoint or a save file, and the way back.
+    const snapshotGame = (): SavedGame => ({
+      machine: this.runner.saveState(), keysTyped: this.keysTyped, fastForward: this.fastForward,
+      autoEga: autoEga?.checked ?? false, skipIntro: skipIntro?.checked ?? false,
+      cpuSpeed: this.runner.stepsPerMillisecond
+    });
+    const restoreGame = (saved: SavedGame) => {
+      this.speaker.resume();
+      this.speaker.silence();
+      const state = this.runner.loadState(saved.machine);
+      this.keysTyped = saved.keysTyped ?? 0;
+      this.fastForward = saved.fastForward ?? false;
+      if (autoEga) autoEga.checked = saved.autoEga;
+      if (skipIntro) skipIntro.checked = saved.skipIntro;
+      this.settings.autoEga = saved.autoEga;
+      this.settings.skipIntro = saved.skipIntro;
+      if (cpuSpeed && saved.cpuSpeed !== undefined && CPU_SPEEDS.some(({ rate }) => rate === saved.cpuSpeed)) {
+        cpuSpeed.value = String(saved.cpuSpeed);
+      }
+      applyCpuSpeed();
+      this.started = true;
+      resume(state);
+    };
+    // Run one save or load at a time, with its progress and outcome in the checkpoint status line.
+    const busy = async (message: string, action: () => Promise<string>) => {
       saveButton.disabled = true;
       loadButton.disabled = true;
-      checkpointStatus.textContent = saving ? 'Saving checkpoint...' : 'Loading checkpoint...';
+      filesButton.disabled = true;
+      checkpointStatus.textContent = message;
       try {
-        if (saving) {
-          await gameCheckpoint({
-            machine: this.runner.saveState(), keysTyped: this.keysTyped, fastForward: this.fastForward,
-            autoEga: autoEga?.checked ?? false, skipIntro: skipIntro?.checked ?? false,
-            cpuSpeed: this.runner.stepsPerMillisecond
-          });
-          checkpointStatus.textContent = 'Checkpoint saved.';
-        } else {
-          this.speaker.resume();
-          this.speaker.silence();
-          const saved = await gameCheckpoint();
-          if (!saved) throw new Error('No saved checkpoint.');
-          const state = this.runner.loadState(saved.machine);
-          this.keysTyped = saved.keysTyped;
-          this.fastForward = saved.fastForward;
-          if (autoEga) autoEga.checked = saved.autoEga;
-          if (skipIntro) skipIntro.checked = saved.skipIntro;
-          this.settings.autoEga = saved.autoEga;
-          this.settings.skipIntro = saved.skipIntro;
-          if (cpuSpeed && saved.cpuSpeed !== undefined && CPU_SPEEDS.some(({ rate }) => rate === saved.cpuSpeed)) {
-            cpuSpeed.value = String(saved.cpuSpeed);
-          }
-          applyCpuSpeed();
-          this.started = true;
-          resume(state);
-          checkpointStatus.textContent = 'Checkpoint loaded.';
-        }
+        checkpointStatus.textContent = await action();
       } catch (error) {
         checkpointStatus.textContent = error instanceof Error ? error.message : 'Checkpoint storage is unavailable.';
       } finally {
         saveButton.disabled = !this.started;
         loadButton.disabled = false;
+        filesButton.disabled = false;
       }
     };
+    const persist = (saving: boolean) => busy(saving ? 'Saving checkpoint...' : 'Loading checkpoint...', async () => {
+      if (saving) {
+        await gameCheckpoint(snapshotGame());
+        return 'Checkpoint saved.';
+      }
+      const saved = await gameCheckpoint();
+      if (!saved) throw new Error('No saved checkpoint.');
+      restoreGame(saved);
+      return 'Checkpoint loaded.';
+    });
+
+    // The "Save files" menu: download the running game as a file, or load one.
+    const filesButton = target.querySelector<HTMLButtonElement>('#save-files-button')!;
+    const filesMenu = target.querySelector<HTMLElement>('#save-files-menu')!;
+    const downloadItem = target.querySelector<HTMLButtonElement>('#download-save')!;
+    const uploadItem = target.querySelector<HTMLButtonElement>('#upload-save')!;
+    const uploadInput = target.querySelector<HTMLInputElement>('#upload-save-input')!;
+    const menuItems = [downloadItem, uploadItem];
+    const setMenu = (open: boolean, focusButton = false) => {
+      filesMenu.hidden = !open;
+      filesButton.setAttribute('aria-expanded', String(open));
+      downloadItem.disabled = !this.started;
+      if (open) (menuItems.find(item => !item.disabled) ?? uploadItem).focus();
+      else if (focusButton) filesButton.focus();
+    };
+    filesButton.addEventListener('click', () => setMenu(Boolean(filesMenu.hidden)));
+    filesMenu.addEventListener('keydown', event => {
+      const enabled = menuItems.filter(item => !item.disabled);
+      const index = enabled.indexOf(document.activeElement as HTMLButtonElement);
+      if (event.key === 'Escape') setMenu(false, true);
+      else if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
+        event.preventDefault();
+        enabled[(index + (event.key === 'ArrowDown' ? 1 : enabled.length - 1)) % enabled.length]?.focus();
+      } else return;
+      event.stopPropagation();
+    });
+    document.addEventListener('click', event => {
+      if (!filesMenu.hidden && !(event.target as Element).closest('.save-files')) setMenu(false);
+    }, { signal });
+    downloadItem.addEventListener('click', () => {
+      setMenu(false, true);
+      void busy('Preparing save file...', async () => {
+        const blob = await encodeSaveFile(snapshotGame(), this.starflt);
+        const link = document.createElement('a');
+        link.href = URL.createObjectURL(blob);
+        link.download = saveFileName();
+        link.click();
+        setTimeout(() => URL.revokeObjectURL(link.href), 10_000);
+        return `Save file downloaded (${Math.ceil(blob.size / 1024).toLocaleString('en-US')} KB).`;
+      });
+    });
+    uploadItem.addEventListener('click', () => {
+      setMenu(false);
+      uploadInput.click();
+    });
+    uploadInput.addEventListener('change', () => {
+      const file = uploadInput.files?.[0];
+      uploadInput.value = '';
+      if (!file) return;
+      void busy(`Loading ${file.name}...`, async () => {
+        const saved = await decodeSaveFile(file, this.starflt) as SavedGame;
+        if (!saved || typeof saved !== 'object' || !saved.machine) throw new Error('This save file has no game in it.');
+        restoreGame(saved);
+        return `Loaded ${file.name}.`;
+      });
+    });
     saveButton.addEventListener('click', () => { void persist(true); });
     loadButton.addEventListener('click', () => { void persist(false); });
     target.querySelector('#run-forth-boot')?.addEventListener('click', play);

@@ -6,6 +6,7 @@ import { CODE_CALL, CFA_EXIT1, ForthEngine, createForthEngine, type ForthToken, 
 import { BLOCK_SIZE, createStarflightFS } from '../src/starflight-fs.ts';
 import { extractFluxes, extractStarSystems } from '../src/starsystems.ts';
 import { EgaAdapter } from '../src/ega.ts';
+import { decodeSaveFile, encodeSaveFile } from '../src/save-file.ts';
 
 type Operation = number | string;
 
@@ -2480,4 +2481,29 @@ test('creditBalance books MU as a committed BONUS transaction at the next keyboa
   runner.queueCall([engine.words.find(word => word.name === 'OVINIT-BALANCE')!.pfa, 'MODULE']);
   for (let steps = 0; session.frames.length > depth && steps < 1_000_000; steps++) runner.advance(1);
   assert.equal(balance() - before, 100000);
+});
+
+test('save files round-trip a checkpoint exactly and refuse other game programs', async () => {
+  const { engine, image, disks, checkpoint } = await realNativeFixture();
+  const game = { machine: checkpoint, keysTyped: 3, fastForward: false, autoEga: true, skipIntro: false, cpuSpeed: 170 };
+  const file = await encodeSaveFile(game, image);
+  assert.deepEqual([...new Uint8Array(await file.slice(0, 2).arrayBuffer())], [0x1f, 0x8b]); // gzip
+  const restored = await decodeSaveFile(file, image) as typeof game;
+  assert.deepEqual(restored, game);
+  assert.ok(restored.machine.physicalMemory instanceof Uint8Array);
+
+  // Both runs continue identically.
+  const [original, reloaded] = [checkpoint, restored.machine].map(state => {
+    const runner = new ForthBootRunner(engine, image, disks);
+    runner.loadState(structuredClone(state));
+    runner.advance(50_000);
+    return runner.snapshot();
+  });
+  assert.equal(reloaded.steps, original.steps);
+  assert.deepEqual(reloaded.trace.slice(-20), original.trace.slice(-20));
+
+  const otherProgram = image.slice();
+  otherProgram[0x200] ^= 1;
+  await assert.rejects(decodeSaveFile(file, otherProgram), /different STARFLT\.COM/);
+  await assert.rejects(decodeSaveFile(new Blob(['hello']), image), /not a Starflight save file/);
 });

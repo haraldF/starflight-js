@@ -406,3 +406,51 @@ html, body {
   font-size: 11px;
   text-align: center;
 }
+
+/* Game tab: the "Save files" drop-down next to Save and Load. */
+.save-files {
+  position: relative;
+}
+
+.save-files-menu {
+  position: absolute;
+  top: calc(100% + 4px);
+  left: 0;
+  z-index: 30;
+  display: flex;
+  flex-direction: column;
+  min-width: 190px;
+  padding: 4px;
+  background: #151824;
+  border: 1px solid #363e58;
+  border-radius: 6px;
+  box-shadow: 0 6px 18px rgba(0, 0, 0, 0.45);
+}
+
+.save-files-menu[hidden] {
+  display: none;
+}
+
+.save-files-menu button {
+  padding: 7px 10px;
+  border: 0;
+  border-radius: 4px;
+  background: transparent;
+  color: #c3ccdb;
+  font: inherit;
+  font-size: 12px;
+  text-align: left;
+  cursor: pointer;
+}
+
+.save-files-menu button:hover:not(:disabled),
+.save-files-menu button:focus-visible {
+  background: #22283a;
+  color: #fff;
+  outline: none;
+}
+
+.save-files-menu button:disabled {
+  color: #545c7e;
+  cursor: not-allowed;
+}

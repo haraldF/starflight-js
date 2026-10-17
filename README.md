@@ -9,8 +9,9 @@ but somehow, it turned into a fully playable version right in the browser.
 
 Note: Please only use this with a licensed copy of Starflight. You can legally buy it for a few bucks from e.g. [GOG](https://www.gog.com/en/game/starflight_1_2).
 
-Usage: After providing the original binaries (STARFLT.COM, STARA.COM, STARB.COM), click on "Run Forth Boot" to execute Starflight's Forth code
-right in the browser.
+Usage: After providing the original binaries (STARFLT.COM, STARA.COM, STARB.COM), click on "Run Forth Boot" to execute Starflight's Forth code right in the browser.
+
+Try it here: [https://haraldf.github.io/starflight-js/](https://haraldf.github.io/starflight-js/).
 
 Use the Save/Load buttons to save or load your game. As the original game, only one save is supported.
 

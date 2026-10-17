@@ -12,7 +12,7 @@ development server is required.
   `.ts` extensions for local imports executed by Node. Do not add a JavaScript
   wrapper, transpilation step, or TypeScript runtime loader.
 - The CLI reads `public/STARA.COM`, `public/STARB.COM`, `public/STARFLT.COM`, and
-  `public/forth-dict.json`, not the binary copies in the repository root.
+  `public/forth-dict.json`
 
 ## Commands
 

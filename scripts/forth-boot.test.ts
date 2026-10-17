@@ -3,7 +3,8 @@ import test from 'node:test';
 import { readFile } from 'node:fs/promises';
 import { ForthBootRunner, STEPS_PER_MILLISECOND, biosKey, screenLines } from '../src/forth-boot.ts';
 import { CODE_CALL, CFA_EXIT1, ForthEngine, createForthEngine, type ForthToken, type ForthWord } from '../src/forth-decompiler.ts';
-import { BLOCK_SIZE } from '../src/starflight-fs.ts';
+import { BLOCK_SIZE, createStarflightFS } from '../src/starflight-fs.ts';
+import { extractFluxes, extractStarSystems } from '../src/starsystems.ts';
 import { EgaAdapter } from '../src/ega.ts';
 
 type Operation = number | string;
@@ -2401,4 +2402,82 @@ test('R/W wraps physical transfers at the 20-bit real-mode boundary', () => {
   ], stara, new Uint8Array(BLOCK_SIZE)).run();
   assert.equal(result.stopReason, 'Forth returned from the entry word.');
   assert.match(result.trace.at(-2)!, /\[0x0000 0x0008 0x00ff\] return$/);
+});
+test('planet densities and gravity follow PLAN-RUL: PLANET records above species 17, the game\'s arrival roll below', async () => {
+  const [stara, starb, starflt] = await Promise.all(['STARA.COM', 'STARB.COM', 'STARFLT.COM']
+    .map(name => readFile(new URL(`../public/${name}`, import.meta.url)).then(bytes => Uint8Array.from(bytes))));
+  const dictionary = await readFile(new URL('../public/forth-dict.json', import.meta.url), 'utf8');
+  const engine = await createForthEngine(stara.slice().buffer, starb.slice().buffer, starflt.slice().buffer, JSON.parse(dictionary));
+  const plset = engine.overlays.get('PLSET-OV')!.memory;
+  const table = (name: string) => {
+    const pfa = engine.words.find(word => word.name === name && word.module === 'PLSET-OV')!.pfa;
+    return (planetClass: number) => plset[pfa + planetClass * 2] | (plset[pfa + planetClass * 2 + 1] << 8);
+  };
+  const fs = createStarflightFS(stara.buffer, starb.buffer);
+  const planetFile = fs.get('PLANET')!;
+  const systems = extractStarSystems(fs.starb, {
+    planetRecord: species => fs.getRecord(planetFile, species), starflt, massTables: { low: table('LO-MASS'), high: table('HI-MASS') }
+  });
+  const planet = (x: number, y: number, orbit: number) => {
+    const found = systems.find(system => system.x === x && system.y === y)!.planets.find(p => p.orbit === orbit)!;
+    return [found.minerals, found.bio, found.gravity, found.rolled];
+  };
+  // Values checked against the emulated game: SCIENCE's MIN/BIO fields and .GRAV's mass after PLSET-OV's setup.
+  assert.deepEqual(planet(125, 100, 3), [39, 100, 1.08, undefined]); // Arth, species 58
+  assert.deepEqual(planet(2, 34, 2), [52, 0, 0.9, true]); // species 7
+  assert.deepEqual(planet(2, 206, 3), [50, 0, 13.8, true]); // species 17, above the 800 mass knee
+  assert.deepEqual(planet(4, 34, 7), [7, 0, 0.91, true]);
+  const all = systems.flatMap(system => system.planets);
+  assert.equal(all.length, 811);
+  assert.equal(all.filter(p => p.minerals === undefined || p.bio === undefined || p.gravity === undefined).length, 0);
+});
+
+test('continuum fluxes come from the 64 FLUX-NODE instances, in mirrored pairs', async () => {
+  const [stara, starb] = await Promise.all(['STARA.COM', 'STARB.COM']
+    .map(name => readFile(new URL(`../public/${name}`, import.meta.url)).then(bytes => Uint8Array.from(bytes))));
+  const fluxes = extractFluxes(createStarflightFS(stara.buffer, starb.buffer).starb).map(f => `${f.x},${f.y}>${f.destX},${f.destY}`);
+  assert.equal(fluxes.length, 64);
+  for (const flux of fluxes) {
+    const [from, to] = flux.split('>');
+    assert.ok(fluxes.includes(`${to}>${from}`), `${flux} has a way back`);
+  }
+  // starflt.com lists 56,142 - 40,146; the game's node goes to 60,146.
+  assert.ok(fluxes.includes('56,142>60,146') && fluxes.includes('69,66>98,79') && fluxes.includes('55,99>248,1'));
+});
+
+test('creditBalance books MU as a committed BONUS transaction at the next keyboard poll, leaving the game as it was', async () => {
+  const { engine, image, disks, checkpoint } = await realNativeFixture();
+  const runner = new ForthBootRunner(engine, image, disks);
+  runner.loadState(structuredClone(checkpoint));
+  type Internals = { session: { frames: unknown[]; dataStack: { pointer: number }; returnStack: unknown[] }; pendingCalls: unknown[] };
+  const internals = runner as unknown as Internals;
+  const session = internals.session;
+  const overlay = () => [...runner.readMemory(0x0192, 0x55a5, 2)];
+  const state = () => [session.frames.length, session.dataStack.pointer, session.returnStack.length, ...overlay()];
+  const scratch = 0x0110; // COM startup code, unused once booted
+  const balance = () => {
+    const depth = session.frames.length;
+    runner.queueCall([engine.words.find(word => word.name === 'OVD@BALANCE')!.pfa, 'MODULE', scratch, '2!']);
+    for (let steps = 0; session.frames.length > depth && steps < 1_000_000; steps++) runner.advance(1);
+    const [lowLow, lowHigh, highLow, highHigh] = runner.readMemory(0x0192, scratch, 4);
+    return (highLow | (highHigh << 8)) + (lowLow | (lowHigh << 8)) * 0x10000; // 2! stores the high cell first
+  };
+  const before = balance();
+  assert.ok(runner.creditBalance(100000));
+  // It waits for a keyboard poll, then runs as a call there and returns to the poll.
+  let atPoll: number[] | undefined;
+  for (let steps = 0; !atPoll && steps < 2_000_000; steps++) {
+    const current = state();
+    runner.advance(1);
+    if (internals.pendingCalls.length === 0) atPoll = current;
+  }
+  assert.ok(atPoll, 'the credit ran at a keyboard poll');
+  for (let steps = 0; session.frames.length > atPoll[0] && steps < 1_000_000; steps++) runner.advance(1);
+  assert.deepEqual(state(), atPoll);
+  assert.equal(balance() - before, 100000);
+  // Committed: the Bank screen's INIT-BALANCE resets the balance to the committed one, which now includes it.
+  const depth = session.frames.length;
+  runner.queueCall([engine.words.find(word => word.name === 'OVINIT-BALANCE')!.pfa, 'MODULE']);
+  for (let steps = 0; session.frames.length > depth && steps < 1_000_000; steps++) runner.advance(1);
+  assert.equal(balance() - before, 100000);
 });

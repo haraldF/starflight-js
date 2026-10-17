@@ -272,6 +272,12 @@ export const STEPS_PER_MILLISECOND = 50;
 // The BIOS keyboard buffer at 0040:001Eh holds 16 words, of which 15 can be in use.
 const BIOS_KEY_BUFFER = 15;
 const TIME_COUNTER = 0x188; // TIME's double millisecond counter: high cell at 188h, low cell at 18Ah
+// Token addresses for threads queueCall() injects: outside the COM image's threads, so they never collide.
+const INJECTED_THREAD = 0xfff0;
+// BANK-TRANS record 3, "BONUS": the transaction type the cheat credit is booked as.
+const BANK_TRANSACTION_BONUS = 3;
+// Keyboard polls: the game calls them from its idle loops, so a queued call can run before them safely.
+const SAFE_POINT_WORDS = new Set(['(?TERMINAL)', '(KEY)']);
 const PIT_HZ = 1193182;
 const TIMER_TICK_MILLISECONDS = 0x10000 * 1000 / PIT_HZ; // the BIOS timer interrupt, about 18.2 Hz
 // The MUSIC overlay's INT 1Ch handler (MUSINT) as HIMUS copies it to MUSSEG:00FFh: PUSH SI/DI/DS/DX/CX/BX/AX, PUSH CS,
@@ -318,6 +324,8 @@ export class ForthBootRunner {
   private speakerFrequency = 0;
   // The step at which the next timer tick is due; 0 recomputes it on the next step.
   private nextTimerStep = 0;
+  // Threads queueCallAtIdle() runs at the next keyboard poll.
+  private pendingCalls: (number | string)[][] = [];
   private ports = new Map<number, number>();
   // Steps executed so far in this run; the clock reads it.
   private step = 0;
@@ -495,6 +503,7 @@ export class ForthBootRunner {
     this.pitLowByte = undefined;
     this.speakerEvents = [];
     this.speakerFrequency = 0;
+    this.pendingCalls = [];
     this.nextTimerStep = 0;
     this.ports.clear();
     this.step = 0;
@@ -623,6 +632,7 @@ export class ForthBootRunner {
     this.pitLowByte = undefined;
     this.speakerEvents = [];
     this.nextTimerStep = 0;
+    this.pendingCalls = [];
     this.ports = new Map(saved.ports ?? []);
     this.inferredColons.clear();
     for (const [key, word] of saved.inferredColons) this.inferredColons.set(key, word);
@@ -683,6 +693,68 @@ export class ForthBootRunner {
     return this.keyQueue.length;
   }
 
+  // Make the running thread call a short kernel thread next, as if its following token were a call to it: numbers
+  // are pushed as literals, names call kernel words. Afterwards the game carries on where it was (a run waiting in
+  // (KEY) runs it now and then waits again). Returns false when no run is in progress. Between arbitrary steps the
+  // game may be halfway through an overlay load or a disk transfer; queueCallAtIdle() waits for a safe point.
+  queueCall(operations: readonly (number | string)[]): boolean {
+    return this.injectCall(operations);
+  }
+
+  // Like queueCall(), but run the thread the next time the game polls the keyboard ((?TERMINAL) or (KEY)), which
+  // it only does from its idle loops, never in the middle of loading an overlay.
+  queueCallAtIdle(operations: readonly (number | string)[]): boolean {
+    const session = this.session;
+    if (!session || session.state === 'stopped' || session.frames.length === 0) return false;
+    this.pendingCalls.push([...operations]);
+    if (session.state === 'waiting') session.state = 'running';
+    return true;
+  }
+
+  private injectCall(operations: readonly (number | string)[]): boolean {
+    const session = this.session;
+    const frame = session?.frames.at(-1);
+    if (!session || !frame || session.state === 'stopped') return false;
+    const hex = (value: number) => `0x${value.toString(16).padStart(4, '0')}`;
+    const tokens: ForthToken[] = operations.map((operation, index) => {
+      const addr = INJECTED_THREAD + index * 2;
+      if (typeof operation === 'number') {
+        return { addr, addrHex: hex(addr), cfa: CFA_LIT, cfaHex: hex(CFA_LIT), name: String(operation & 0xffff), kind: 'lit', arg: operation & 0xffff };
+      }
+      const target = this.engine.words.find(word => word.name === operation && word.module === 'KERNEL');
+      if (!target) throw new Error(`No kernel word ${operation}`);
+      return { addr, addrHex: hex(addr), cfa: target.cfa, cfaHex: target.cfaHex, name: target.name, kind: 'call' };
+    });
+    const end = INJECTED_THREAD + operations.length * 2;
+    tokens.push({ addr: end, addrHex: hex(end), cfa: CFA_EXIT1, cfaHex: hex(CFA_EXIT1), name: ';', kind: 'exit' });
+    const word: ForthWord = {
+      name: 'INJECTED', cfa: INJECTED_THREAD - 2, cfaHex: hex(INJECTED_THREAD - 2), pfa: INJECTED_THREAD, pfaHex: hex(INJECTED_THREAD),
+      codep: CODE_CALL, codepHex: hex(CODE_CALL), module: 'KERNEL', type: 'colon', typeLabel: 'thread injected by the runner',
+      decompiled: `: INJECTED ${tokens.map(token => token.name).join(' ')}`, tokens, rawBytes: new Uint8Array()
+    };
+    const returnAddress = frame.word.tokens[frame.tokenIndex]?.addr ?? 0;
+    session.returnStack.push(returnAddress);
+    session.frames.push({ word, tokenIndex: 0, returnAddress });
+    if (session.state === 'waiting') session.state = 'running';
+    return true;
+  }
+
+  // Add `amount` MU to the player's bank account the way the game books interest (BANK-OV's INT%):
+  // `amount. ' T+BALANCE MODULE  3 ' OVTRANSACT MODULE`. T+BALANCE changes the current balance and marks it
+  // uncommitted; TRANSACT commits it as a dated transaction of type 3 (BONUS in the BANK-TRANS file). Without the
+  // commit the Bank screen, which shows the committed balance and resets uncommitted changes (INIT-BALANCE), never
+  // shows it. MODULE puts the previous overlay back after each; EXECUTE, and so MODULE, takes a word's PFA, as ' does.
+  // It runs at the game's next keyboard poll.
+  creditBalance(amount: number): boolean {
+    const pfa = (name: string) => this.engine.words.find(word => word.name === name && word.module === 'KERNEL')?.pfa;
+    const add = pfa('T+BALANCE'), commit = pfa('OVTRANSACT');
+    if (add === undefined || commit === undefined) return false;
+    return this.queueCallAtIdle([
+      amount & 0xffff, Math.floor(amount / 0x10000) & 0xffff, add, 'MODULE',
+      BANK_TRANSACTION_BONUS, commit, 'MODULE'
+    ]);
+  }
+
   // The current result: trace, screens, and why the run stopped (empty while it is still running).
   snapshot(): ForthBootResult {
     const session = this.session;
@@ -712,7 +784,7 @@ export class ForthBootRunner {
   advance(budget: number): BootState {
     const session = this.session;
     if (!session || session.state === 'stopped') return 'stopped';
-    if (session.state === 'waiting' && this.keyQueue.length === 0) return 'waiting';
+    if (session.state === 'waiting' && this.keyQueue.length === 0 && this.pendingCalls.length === 0) return 'waiting';
     if (session.state === 'break') session.passBreakpoint = true;
     session.state = 'running';
 
@@ -1018,6 +1090,13 @@ export class ForthBootRunner {
           if (executionOverlayStop) {
             stopReason = executionOverlayStop;
             break;
+          }
+          if (target.codep === CODE_USER_VECTOR && SAFE_POINT_WORDS.has(executionTarget?.name ?? '') && this.pendingCalls.length > 0) {
+            // A keyboard poll: the game is in an idle loop, so run a queued call first and then poll again.
+            frame.tokenIndex--;
+            steps--;
+            this.injectCall(this.pendingCalls.shift()!);
+            continue;
           }
           if (!executionTarget) {
             const codep = readWord(executionCfa);

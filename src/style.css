@@ -321,3 +321,88 @@ html, body {
     display: none;
   }
 }
+
+/* Star Systems tab: the starmap takes the free width, the star system column stays narrow. */
+.systems-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(300px, 380px);
+  gap: 20px;
+  align-items: start;
+}
+
+/* As large a square as fits the column and the window height. */
+.galaxy-frame {
+  position: relative;
+  width: min(100%, max(320px, calc(100vh - 200px)));
+  aspect-ratio: 1;
+  margin: 0 auto;
+  background: #0b0d14;
+  border: 1px solid #1f2537;
+  border-radius: 6px;
+  overflow: hidden;
+}
+
+@media (max-width: 900px) {
+  .systems-grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .galaxy-frame {
+    width: 100%;
+  }
+}
+
+/* Star Systems tab: shortcut buttons to systems with colonizable planets. */
+.colony-shortcut {
+  padding: 3px 8px;
+  font-size: 11px;
+  border-color: #3a4a2e;
+}
+
+.colony-shortcut.active {
+  background: #2a3a20;
+  border-color: #c3e88d;
+  color: #c3e88d;
+}
+
+.location-shortcut {
+  padding: 3px 8px;
+  font-size: 11px;
+  border-color: #2b4352;
+}
+
+.location-shortcut.active {
+  background: #1d3442;
+  border-color: #89ddff;
+  color: #89ddff;
+}
+
+/* Starmap zoom controls, over the map's top right corner. */
+.galaxy-zoom {
+  position: absolute;
+  top: 8px;
+  right: 8px;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  z-index: 10;
+}
+
+.galaxy-zoom .btn {
+  width: 28px;
+  height: 28px;
+  padding: 0;
+  font-size: 15px;
+  line-height: 1;
+  background: rgba(34, 40, 58, 0.85);
+}
+
+.galaxy-zoom span {
+  min-width: 3.5em;
+  padding: 3px 6px;
+  border-radius: 4px;
+  background: rgba(18, 22, 34, 0.85);
+  color: #7982a9;
+  font-size: 11px;
+  text-align: center;
+}

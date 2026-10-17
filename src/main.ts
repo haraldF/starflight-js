@@ -1,6 +1,8 @@
 import './style.css';
 import { createStarflightFS, type StarflightFS, type DirEntry } from './starflight-fs';
-import { extractStarSystems, type StarSystemInfo } from './starsystems';
+import { extractFluxes, extractStarSystems, type StarSystemInfo } from './starsystems';
+import { markColonizablePlanets } from './colonizable';
+import { markLocations } from './locations';
 import { SystemVisualizer } from './system-visualizer';
 import { createForthEngine, type ForthEngine } from './forth-decompiler';
 import { ForthExplorer } from './forth-explorer';
@@ -17,6 +19,12 @@ import {
   type ForthGraphicsScreen,
   type ForthTextScreen
 } from './forth-boot';
+
+// The hidden cheat: type this word on the page (outside the game screen) to add the amount to the bank account.
+const CHEAT_WORD = 'money';
+const CHEAT_AMOUNT = 100000;
+// How long keys that could start the cheat word wait before the game gets them anyway.
+const CHEAT_HOLD_MILLISECONDS = 1000;
 
 // GAME-OV's ?GAME.IN.PROGRESS (:TIMESTAMP @), which START. calls right after the intro screens.
 const INTRO_DONE_CFA = 0xf525;
@@ -495,12 +503,54 @@ class GameScreen {
   private started = false;
   private loopState: BootState = 'stopped';
   // The game options, kept while the Game tab is unmounted.
-  private settings = { autoEga: true, skipIntro: true, sound: true, cpuSpeed: DEFAULT_CPU_SPEED };
+  private settings = { autoEga: true, skipIntro: false, sound: true, cpuSpeed: DEFAULT_CPU_SPEED };
   // Aborted on unmount: removes this mount's document listeners.
   private mounted?: AbortController;
 
   constructor(forthEngine: ForthEngine, starflt: Uint8Array, fs: StarflightFS) {
     this.runner = new ForthBootRunner(forthEngine, starflt, fs);
+  }
+
+  // Add MU to the running game's bank account; false when no game is running.
+  credit(amount: number): boolean {
+    return this.started && this.runner.creditBalance(amount);
+  }
+
+  // The cheat word typed on the game screen: while the keys spell the start of it they are held back from the
+  // game; the whole word credits the account and the game never sees it. Any other key, or a pause, passes the held
+  // keys on first, so play is unaffected. Returns true when `key` was held.
+  private heldKeys: string[] = [];
+  private heldTimer = 0;
+
+  private holdForCheat(key: string): boolean {
+    const matches = (index: number) => key.length === 1 && key.toLowerCase() === CHEAT_WORD[index];
+    window.clearTimeout(this.heldTimer);
+    if (!matches(this.heldKeys.length)) {
+      this.releaseHeldKeys();
+      if (!matches(0)) return false;
+    }
+    this.heldKeys.push(key);
+    if (this.heldKeys.length === CHEAT_WORD.length) {
+      this.heldKeys = [];
+      if (this.credit(CHEAT_AMOUNT)) console.info(`Credited ${CHEAT_AMOUNT.toLocaleString('en-US')} MU.`);
+      return true;
+    }
+    this.heldTimer = window.setTimeout(() => this.releaseHeldKeys(), CHEAT_HOLD_MILLISECONDS);
+    return true;
+  }
+
+  private releaseHeldKeys() {
+    window.clearTimeout(this.heldTimer);
+    const held = this.heldKeys;
+    this.heldKeys = [];
+    for (const name of held) {
+      const key = biosKey(name);
+      if (key !== undefined) this.sendKey(key);
+    }
+  }
+
+  private sendKey(key: number) {
+    if (this.runner.pressKey(key)) this.keysTyped++;
   }
 
   // Stop the animation loop and the sound, e.g. when another tab is shown. The run itself is kept.
@@ -527,7 +577,7 @@ class GameScreen {
             <button id="load-game" class="btn" type="button">Load</button>
             <button id="full-screen" class="btn" type="button">Full screen</button>
             <label><input id="auto-ega" type="checkbox" checked> Auto-select EGA</label>
-            <label><input id="skip-intro" type="checkbox" checked> Skip intro</label>
+            <label><input id="skip-intro" type="checkbox"> Skip intro</label>
             <label><input id="sound" type="checkbox" checked> Sound</label>
             <label>CPU <select id="cpu-speed">${CPU_SPEEDS.map(({ label, rate }) =>
               `<option value="${rate}"${rate === DEFAULT_CPU_SPEED ? ' selected' : ''}>${label}</option>`).join('')}</select></label>
@@ -736,7 +786,8 @@ class GameScreen {
       // Held keys auto-repeat faster than the game reads them; queueing every repeat would keep the player moving
       // after the key is released. Repeats only count once the game has taken the previous key.
       if (event.repeat && this.runner.pendingKeys > 0) return;
-      if (this.runner.pressKey(key)) this.keysTyped++;
+      if (!event.repeat && this.holdForCheat(event.key)) return;
+      this.sendKey(key);
     });
 
     // Back on the Game tab: carry on with the run that was paused when another tab was shown.
@@ -796,7 +847,7 @@ class MainApp {
 
   constructor(fs: StarflightFS, systems: StarSystemInfo[], forthEngine: ForthEngine, starflt: Uint8Array) {
     this.explorerApp = new ExplorerApp(fs);
-    this.systemVisualizer = new SystemVisualizer(systems);
+    this.systemVisualizer = new SystemVisualizer(systems, extractFluxes(fs.starb));
     this.forthExplorer = new ForthExplorer(forthEngine);
     this.kernelDisassembler = new KernelDisassembler(starflt);
     this.gameScreen = new GameScreen(forthEngine, starflt, fs);
@@ -865,6 +916,24 @@ class MainApp {
     });
 
     this.renderCurrentTab();
+    this.listenForCheats();
+  }
+
+  // An easter egg: typing "money" anywhere on the page except form fields credits the running game's bank account
+  // with 100,000 MU. Nothing on the page hints at it. On the game screen GameScreen.holdForCheat handles it, so the
+  // letters do not reach the game.
+  private listenForCheats() {
+    let typed = '';
+    document.addEventListener('keydown', event => {
+      const target = event.target as HTMLElement | null;
+      if (event.ctrlKey || event.metaKey || event.altKey || event.key.length !== 1) return;
+      if (target?.closest('input, textarea, select, [contenteditable], canvas')) return; // typing there is not page input
+      typed = (typed + event.key.toLowerCase()).slice(-CHEAT_WORD.length);
+      if (typed === CHEAT_WORD && this.gameScreen.credit(CHEAT_AMOUNT)) {
+        typed = '';
+        console.info(`Credited ${CHEAT_AMOUNT.toLocaleString('en-US')} MU.`);
+      }
+    });
   }
 
   private switchTab(tab: ActiveTab) {
@@ -930,8 +999,25 @@ async function startApp(files: GameFiles, forthDict: Parameters<typeof createFor
   console.log(`Loaded ${forthEngine.words.length} Forth words across ${forthEngine.modules.length} modules.`);
 
   console.log("Extracting star systems and planets from STARB.COM instance tree...");
-  const systems = extractStarSystems(fs.starb);
+  const planetFile = fs.get('PLANET');
+  // PLSET-OV's LO-MASS and HI-MASS tables (DOES> words: the cell at PFA + 2 * class), for the planets' mass roll.
+  const massTable = (name: string) => {
+    const word = forthEngine.words.find(candidate => candidate.name === name && candidate.module === 'PLSET-OV');
+    const memory = forthEngine.overlays.get('PLSET-OV')?.memory;
+    return word && memory ? (planetClass: number) => {
+      const address = word.pfa + planetClass * 2;
+      return memory[address] | (memory[address + 1] << 8);
+    } : undefined;
+  };
+  const low = massTable('LO-MASS'), high = massTable('HI-MASS');
+  const systems = extractStarSystems(fs.starb, {
+    planetRecord: species => planetFile && fs.getRecord(planetFile, species),
+    starflt: new Uint8Array(starflt),
+    massTables: low && high ? { low, high } : undefined
+  });
   console.log(`Extracted ${systems.length} star systems.`);
+  markColonizablePlanets(systems);
+  markLocations(systems);
 
   // Expose on window for easy browser console exploration
   (window as unknown as { starflightFS: StarflightFS; starSystems: StarSystemInfo[] }).starflightFS = fs;

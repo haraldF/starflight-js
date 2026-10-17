@@ -6,6 +6,7 @@ import { createForthEngine, type ForthEngine } from './forth-decompiler';
 import { ForthExplorer } from './forth-explorer';
 import { KernelDisassembler } from './kernel-disassembler';
 import { SpeakerAudio } from './speaker-audio';
+import { fetchGameFiles, hasAllGameFiles, loadCachedGameFiles, showGameFilesPage, type GameFiles } from './game-files';
 import {
   CP437,
   ForthBootRunner,
@@ -71,14 +72,6 @@ const RAW_CHUNK_SIZE = 512;
 
 type FilterMode = 'all' | 'mapped' | 'virtual' | 'pad';
 type ActiveTab = 'explorer' | 'systems' | 'forth' | 'kernel' | 'game';
-
-async function loadStar(url: string): Promise<ArrayBuffer> {
-  const response = await fetch(url);
-  if (!response.ok) {
-    throw new Error(`Failed to load ${url}: ${response.status} ${response.statusText}`);
-  }
-  return response.arrayBuffer();
-}
 
 /**
  * Formats a Uint8Array into a colored hex dump HTML string.
@@ -907,21 +900,28 @@ class MainApp {
   }
 }
 
+// Fetch the game files as usual; take any the server lacks from the browser's cache, and ask the user for the rest.
 async function main() {
   console.log("Loading Starflight game files...");
-  const [stara, starb, starflt, forthDictResponse] = await Promise.all([
-    loadStar('STARA.COM'),
-    loadStar('STARB.COM'),
-    loadStar('STARFLT.COM'),
-    fetch('forth-dict.json')
-  ]);
-
+  const [fetched, forthDictResponse] = await Promise.all([fetchGameFiles(), fetch('forth-dict.json')]);
+  const files = hasAllGameFiles(fetched) ? fetched : { ...(await loadCachedGameFiles()), ...fetched };
   if (!forthDictResponse.ok) {
     throw new Error(`Failed to load forth-dict.json: ${forthDictResponse.status} ${forthDictResponse.statusText}`);
   }
   const forthDict = await forthDictResponse.json();
+  if (hasAllGameFiles(files)) {
+    await startApp(files, forthDict);
+    return;
+  }
+  console.log("Game files missing on the server and in the cache; asking for them.");
+  const app = document.getElementById('app');
+  if (!app) throw new Error('The page has no #app element.');
+  showGameFilesPage(app, files, chosen => { startApp(chosen, forthDict).catch(console.error); });
+}
 
-  console.log("Downloaded STARA.COM:", stara.byteLength, "bytes, STARB.COM:", starb.byteLength, "bytes");
+async function startApp(files: GameFiles, forthDict: Parameters<typeof createForthEngine>[3]) {
+  const { 'STARA.COM': stara, 'STARB.COM': starb, 'STARFLT.COM': starflt } = files;
+  console.log("Loaded STARA.COM:", stara.byteLength, "bytes, STARB.COM:", starb.byteLength, "bytes");
 
   const fs = createStarflightFS(stara, starb);
   console.log(`Mapped all ${fs.entries.length} directory slots from Starflight virtual disk.`);

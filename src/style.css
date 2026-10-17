@@ -226,3 +226,98 @@ html, body {
   outline: none;
   border-color: #82aaff;
 }
+
+/* Landing page: asks for the game files when the server does not have them. */
+.files-page {
+  max-width: 640px;
+  margin: 10vh auto 0;
+  padding: 0 16px;
+  line-height: 1.6;
+  font-size: 13px;
+}
+
+.files-page h1 {
+  color: #82aaff;
+  font-size: 18px;
+  margin: 0 0 12px;
+}
+
+.files-page p {
+  color: #a9b1d6;
+  margin: 0 0 16px;
+}
+
+.files-drop {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 4px;
+  padding: 40px 16px;
+  border: 2px dashed #363e58;
+  border-radius: 8px;
+  background: #141721;
+  color: #7982a9;
+  cursor: pointer;
+  text-align: center;
+  transition: border-color 0.15s ease, background-color 0.15s ease;
+}
+
+.files-drop strong {
+  color: #c3ccdb;
+  font-size: 15px;
+}
+
+.files-drop:hover,
+.files-drop:focus-visible,
+.files-drop.dragging {
+  border-color: #82aaff;
+  background: #1e2436;
+  outline: none;
+}
+
+.files-input {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  opacity: 0;
+  pointer-events: none;
+}
+
+.files-list {
+  list-style: none;
+  margin: 16px 0;
+  padding: 0;
+}
+
+.files-list li {
+  display: grid;
+  grid-template-columns: 1.5em 9em 1fr auto;
+  gap: 8px;
+  padding: 6px 8px;
+  border-bottom: 1px solid #1a1e2b;
+  color: #7982a9;
+}
+
+.files-list li span:nth-child(2) {
+  color: #c3ccdb;
+}
+
+.files-list li.ready span:first-child,
+.files-list li.ready span:last-child {
+  color: #c3e88d;
+}
+
+.files-error {
+  color: #ff757f;
+  min-height: 1.6em;
+}
+
+@media (max-width: 480px) {
+  .files-list li {
+    grid-template-columns: 1.5em 1fr auto;
+  }
+
+  .files-list li span:nth-child(3) {
+    display: none;
+  }
+}

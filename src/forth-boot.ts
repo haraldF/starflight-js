@@ -43,6 +43,8 @@ interface BootSession {
   clock?: { step: number; milliseconds: number };
   // BIOS timer ticks (INT 8, then INT 1Ch) delivered so far, at 1193182 / 65536 Hz of emulated time.
   timerTicks?: number;
+  // Set when the program returned to DOS (GO 0), as BYE does after the game saves.
+  exitedToDos?: boolean;
 }
 
 // A change of the PC speaker's output at an emulated time: a square wave at `frequency` Hz, or silence (0).
@@ -165,6 +167,8 @@ export interface ForthBootResult {
   screen: ForthTextScreen;
   // True when the run stopped because (KEY) found the keyboard queue empty.
   waitingForKey: boolean;
+  // True when the program returned to DOS, as the game does after saving.
+  exitedToDos: boolean;
   // The displayed EGA picture while a graphics mode is set.
   graphics?: ForthGraphicsScreen;
 }
@@ -767,6 +771,7 @@ export class ForthBootRunner {
       stopReason: session.stopReason,
       screen: this.snapshotScreen(),
       waitingForKey: session.state === 'waiting' || session.waitedForKey === true,
+      exitedToDos: session.exitedToDos === true,
       graphics: this.egaGraphics ? this.snapshotGraphics() : undefined
     };
   }
@@ -1162,7 +1167,9 @@ export class ForthBootRunner {
         }
       }
 
-      if (frames.length === 0 && stopReason === undefined && !waiting) stopReason = 'Forth returned from the entry word.';
+      if (frames.length === 0 && stopReason === undefined && !waiting) {
+        stopReason = session.exitedToDos ? 'The game exited to DOS.' : 'Forth returned from the entry word.';
+      }
     } catch (error) {
       stopReason = error instanceof Error ? error.message : String(error);
     }
@@ -1753,6 +1760,7 @@ export class ForthBootRunner {
         const address = pop(dataStack, 'data');
         if (address === 0) {
           this.session!.frames.length = 0;
+          this.session!.exitedToDos = true;
           return { supported: true, note: 'DOS program return', output };
         }
         if (address === 0x100) {

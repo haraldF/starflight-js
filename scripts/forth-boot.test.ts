@@ -265,7 +265,7 @@ test('compiler helpers redirect threads, GO dispatches translated entries, and a
   assert.equal(translated.result.stopReason, 'Forth returned from the entry word.', translated.result.trace.join('\n'));
   assert.match(translated.result.trace.at(-2)!, /\[0xbef2\] return$/);
   const exit = await runRealNative([0, get('GO'), 0xbad]);
-  assert.equal(exit.result.stopReason, 'Forth returned from the entry word.', exit.result.trace.join('\n'));
+  assert.equal(exit.result.stopReason, 'The game exited to DOS.', exit.result.trace.join('\n'));
   const syscall = await runRealNative([0x0d, 0, get('SYSCALL'), get('PRTSCR'), get('XKEYINT')]);
   assert.equal(syscall.result.stopReason, 'Forth returned from the entry word.', syscall.result.trace.join('\n'));
   assert.ok(syscall.result.output.length > 0);
@@ -2506,4 +2506,13 @@ test('save files round-trip a checkpoint exactly and refuse other game programs'
   otherProgram[0x200] ^= 1;
   await assert.rejects(decodeSaveFile(file, otherProgram), /different STARFLT\.COM/);
   await assert.rejects(decodeSaveFile(new Blob(['hello']), image), /not a Starflight save file/);
+});
+
+test('BYE reports the return to DOS, as after saving the game', async () => {
+  const fixture = await realNativeFixture();
+  const runner = new ForthBootRunner(fixture.engine, fixture.image, fixture.disks);
+  const result = runner.run(0x085b, 1_000); // BYE_2: FREEZE (RESTORE) 0 GO
+  assert.equal(result.stopReason, 'The game exited to DOS.', result.trace.join('\n'));
+  assert.equal(result.exitedToDos, true);
+  assert.equal(runner.run(0x0937, 10).exitedToDos, false);
 });

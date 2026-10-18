@@ -637,6 +637,8 @@ class GameScreen {
       const result = this.runner.snapshot();
       if (result.graphics) this.renderGraphicsScreen(canvas, result.graphics);
       else this.renderTextScreen(canvas, result.screen);
+      // The game quits to DOS after saving (and from its exit prompts); say so instead of leaving a blank screen.
+      if (result.exitedToDos) this.renderExitMessage(canvas);
       const seconds = (this.runner.milliseconds / 1000).toFixed(1);
       const keys = `${autoEga?.checked ? 'EGA auto-selected · ' : ''}${this.keysTyped} key(s) typed`;
       const where = state === 'waiting' ? 'waiting for a key'
@@ -909,6 +911,25 @@ class GameScreen {
         context.fillText(glyph, col * 8, row * 8, 8);
       }
     }
+  }
+
+  // A notice over the stopped screen once the program has returned to DOS.
+  private renderExitMessage(canvas: HTMLCanvasElement) {
+    const context = canvas.getContext('2d');
+    if (!context) return;
+    const lines = ['Starflight has exited to DOS.', 'Run Forth Boot to start again.'];
+    const lineHeight = 10;
+    context.fillStyle = TEXT_PALETTE[1];
+    context.fillRect(0, canvas.height / 2 - lineHeight * 1.5, canvas.width, lineHeight * 3);
+    context.font = '8px "Courier New", monospace';
+    context.textAlign = 'center';
+    context.textBaseline = 'middle';
+    context.fillStyle = TEXT_PALETTE[15];
+    lines.forEach((line, index) => {
+      context.fillText(line, canvas.width / 2, canvas.height / 2 + (index - 0.5) * lineHeight);
+    });
+    context.textAlign = 'start';
+    context.textBaseline = 'top';
   }
 
   private containerCanvas(target: HTMLElement): HTMLCanvasElement | null {

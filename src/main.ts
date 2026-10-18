@@ -48,7 +48,25 @@ interface SavedGame {
   cpuSpeed?: number;
 }
 
-async function gameCheckpoint(saved?: SavedGame): Promise<SavedGame | undefined> {
+// Checkpoints in IndexedDB: the manual one under 'game', autosaves in AUTOSAVE_SLOTS rotating slots, and an index of
+// when each was saved, so the Load menu can list them without reading the games themselves.
+const MANUAL_CHECKPOINT = 'game';
+const AUTOSAVE_SLOTS = 5;
+const AUTOSAVE_INTERVAL_MILLISECONDS = 60_000;
+const CHECKPOINT_INDEX = 'index';
+
+interface CheckpointEntry {
+  key: string;
+  savedAt?: number;
+}
+
+interface CheckpointIndex {
+  manualSavedAt?: number;
+  // Newest first.
+  autosaves: { key: string; savedAt: number }[];
+}
+
+async function checkpointTransaction<T>(mode: IDBTransactionMode, body: (store: IDBObjectStore) => () => T): Promise<T> {
   const database = await new Promise<IDBDatabase>((resolve, reject) => {
     const request = indexedDB.open('starflight-checkpoints', 1);
     request.onupgradeneeded = () => request.result.createObjectStore('checkpoints');
@@ -57,17 +75,71 @@ async function gameCheckpoint(saved?: SavedGame): Promise<SavedGame | undefined>
     request.onblocked = () => reject(new Error('Checkpoint storage is blocked by another tab.'));
   });
   try {
-    return await new Promise<SavedGame | undefined>((resolve, reject) => {
-      const transaction = database.transaction('checkpoints', saved ? 'readwrite' : 'readonly');
-      const store = transaction.objectStore('checkpoints');
-      const request = saved ? store.put(saved, 'game') : store.get('game');
-      transaction.oncomplete = () => resolve(saved ?? request.result);
+    return await new Promise<T>((resolve, reject) => {
+      const transaction = database.transaction('checkpoints', mode);
+      const result = body(transaction.objectStore('checkpoints'));
+      transaction.oncomplete = () => resolve(result());
       transaction.onabort = () => reject(transaction.error ?? new Error('Checkpoint storage was interrupted.'));
       transaction.onerror = () => reject(transaction.error ?? new Error('Checkpoint storage failed.'));
     });
   } finally {
     database.close();
   }
+}
+
+// Read the index, let `update` change it (and queue writes), then store it, all in one transaction.
+function updateCheckpointIndex(store: IDBObjectStore, update: (index: CheckpointIndex) => void): void {
+  const request = store.get(CHECKPOINT_INDEX);
+  request.onsuccess = () => {
+    const index: CheckpointIndex = request.result ?? { autosaves: [] };
+    update(index);
+    store.put(index, CHECKPOINT_INDEX);
+  };
+}
+
+function readCheckpoint(key: string): Promise<SavedGame | undefined> {
+  return checkpointTransaction('readonly', store => {
+    const request = store.get(key);
+    return () => request.result;
+  });
+}
+
+function writeManualCheckpoint(saved: SavedGame): Promise<void> {
+  return checkpointTransaction('readwrite', store => {
+    store.put(saved, MANUAL_CHECKPOINT);
+    updateCheckpointIndex(store, index => { index.manualSavedAt = Date.now(); });
+    return () => undefined;
+  });
+}
+
+// Store an autosave in the oldest of the AUTOSAVE_SLOTS slots (or an unused one).
+function writeAutosave(saved: SavedGame): Promise<void> {
+  return checkpointTransaction('readwrite', store => {
+    updateCheckpointIndex(store, index => {
+      const slots = Array.from({ length: AUTOSAVE_SLOTS }, (_, slot) => `autosave-${slot}`);
+      const used = index.autosaves.filter(entry => slots.includes(entry.key)).slice(0, AUTOSAVE_SLOTS);
+      const key = slots.find(slot => !used.some(entry => entry.key === slot)) ?? used[used.length - 1].key;
+      store.put(saved, key);
+      index.autosaves = [{ key, savedAt: Date.now() }, ...used.filter(entry => entry.key !== key)];
+    });
+    return () => undefined;
+  });
+}
+
+// The manual checkpoint (if any) and the autosaves, newest first. A manual checkpoint saved before the index
+// existed has no time.
+function listCheckpoints(): Promise<{ manual?: CheckpointEntry; autosaves: CheckpointEntry[] }> {
+  return checkpointTransaction('readonly', store => {
+    const index = store.get(CHECKPOINT_INDEX);
+    const manual = store.getKey(MANUAL_CHECKPOINT);
+    return () => {
+      const saved: CheckpointIndex = index.result ?? { autosaves: [] };
+      return {
+        manual: manual.result === undefined ? undefined : { key: MANUAL_CHECKPOINT, savedAt: saved.manualSavedAt },
+        autosaves: saved.autosaves
+      };
+    };
+  });
 }
 
 // The 16 CGA/EGA text colors, indexed by attribute nibble.
@@ -503,6 +575,8 @@ class GameScreen {
   // the page is hidden, and resumes from there.
   private started = false;
   private loopState: BootState = 'stopped';
+  // Real time played since the last autosave or load, in milliseconds.
+  private autosaveElapsed = 0;
   // The game options, kept while the Game tab is unmounted.
   private settings = { autoEga: true, skipIntro: false, sound: true, cpuSpeed: DEFAULT_CPU_SPEED };
   // Aborted on unmount: removes this mount's document listeners.
@@ -579,7 +653,10 @@ class GameScreen {
           <div class="boot-controls">
             <button id="run-forth-boot" class="btn" type="button">Run Forth Boot</button>
             <button id="save-game" class="btn" type="button" disabled>Save</button>
-            <button id="load-game" class="btn" type="button">Load</button>
+            <div class="save-files">
+              <button id="load-game" class="btn" type="button" aria-haspopup="menu" aria-expanded="false" aria-controls="load-menu">Load &#9662;</button>
+              <div id="load-menu" class="save-files-menu" role="menu" aria-labelledby="load-game" hidden></div>
+            </div>
             <div class="save-files">
               <button id="save-files-button" class="btn" type="button" aria-haspopup="menu" aria-expanded="false" aria-controls="save-files-menu">Save files &#9662;</button>
               <div id="save-files-menu" class="save-files-menu" role="menu" aria-labelledby="save-files-button" hidden>
@@ -675,6 +752,10 @@ class GameScreen {
         } else {
           state = this.runner.advance(Math.round(elapsed * this.runner.stepsPerMillisecond));
         }
+        if (!this.fastForward && state !== 'stopped') {
+          this.autosaveElapsed += elapsed;
+          if (this.autosaveElapsed >= AUTOSAVE_INTERVAL_MILLISECONDS) autosave();
+        }
         const events = this.runner.takeSpeakerEvents();
         if (sound?.checked && !this.fastForward && state !== 'stopped' && !document.hidden) {
           this.speaker.play(events, this.runner.milliseconds, this.runner.speakerTone);
@@ -704,6 +785,7 @@ class GameScreen {
       this.settings.skipIntro = skipIntro?.checked ?? false;
       this.runner.start(0x0937, autoEga?.checked ? egaKeys : []);
       this.started = true;
+      this.autosaveElapsed = 0;
       saveButton.disabled = false;
       checkpointStatus.textContent = '';
       resume('running');
@@ -747,16 +829,56 @@ class GameScreen {
         filesButton.disabled = false;
       }
     };
-    const persist = (saving: boolean) => busy(saving ? 'Saving checkpoint...' : 'Loading checkpoint...', async () => {
-      if (saving) {
-        await gameCheckpoint(snapshotGame());
-        return 'Checkpoint saved.';
-      }
-      const saved = await gameCheckpoint();
-      if (!saved) throw new Error('No saved checkpoint.');
-      restoreGame(saved);
-      return 'Checkpoint loaded.';
+    const saveCheckpoint = () => busy('Saving checkpoint...', async () => {
+      await writeManualCheckpoint(snapshotGame());
+      return 'Checkpoint saved.';
     });
+    const loadCheckpoint = (key: string, label: string) => busy(`Loading ${label}...`, async () => {
+      const saved = await readCheckpoint(key);
+      if (!saved) throw new Error(`No ${label}.`);
+      restoreGame(saved);
+      this.autosaveElapsed = 0;
+      return `Loaded ${label}.`;
+    });
+    // Every minute of play (the page shown, the game neither stopped nor skipping the intro) goes to an autosave
+    // slot, without blocking the other checkpoint buttons.
+    let autosaving = false;
+    const autosave = () => {
+      this.autosaveElapsed = 0;
+      if (autosaving) return;
+      autosaving = true;
+      writeAutosave(snapshotGame()).then(
+        () => { checkpointStatus.textContent = `Autosaved at ${new Date().toLocaleTimeString()}.`; },
+        (error: unknown) => {
+          checkpointStatus.textContent = `Autosave failed: ${error instanceof Error ? error.message : 'checkpoint storage is unavailable.'}`;
+        }
+      ).finally(() => { autosaving = false; });
+    };
+
+    // A drop-down menu under `button`: arrow keys move between its enabled items, Esc or a click elsewhere closes it.
+    const dropDown = (button: HTMLButtonElement, menu: HTMLElement) => {
+      const items = () => [...menu.querySelectorAll<HTMLButtonElement>('button')].filter(item => !item.disabled);
+      const set = (open: boolean, focusButton = false) => {
+        menu.hidden = !open;
+        button.setAttribute('aria-expanded', String(open));
+        if (open) items()[0]?.focus();
+        else if (focusButton) button.focus();
+      };
+      menu.addEventListener('keydown', event => {
+        const enabled = items();
+        const index = enabled.indexOf(document.activeElement as HTMLButtonElement);
+        if (event.key === 'Escape') set(false, true);
+        else if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
+          event.preventDefault();
+          enabled[(index + (event.key === 'ArrowDown' ? 1 : enabled.length - 1)) % enabled.length]?.focus();
+        } else return;
+        event.stopPropagation();
+      });
+      document.addEventListener('click', event => {
+        if (!menu.hidden && !button.parentElement!.contains(event.target as Node)) set(false);
+      }, { signal });
+      return set;
+    };
 
     // The "Save files" menu: download the running game as a file, or load one.
     const filesButton = target.querySelector<HTMLButtonElement>('#save-files-button')!;
@@ -764,28 +886,50 @@ class GameScreen {
     const downloadItem = target.querySelector<HTMLButtonElement>('#download-save')!;
     const uploadItem = target.querySelector<HTMLButtonElement>('#upload-save')!;
     const uploadInput = target.querySelector<HTMLInputElement>('#upload-save-input')!;
-    const menuItems = [downloadItem, uploadItem];
+    const setFilesMenu = dropDown(filesButton, filesMenu);
     const setMenu = (open: boolean, focusButton = false) => {
-      filesMenu.hidden = !open;
-      filesButton.setAttribute('aria-expanded', String(open));
       downloadItem.disabled = !this.started;
-      if (open) (menuItems.find(item => !item.disabled) ?? uploadItem).focus();
-      else if (focusButton) filesButton.focus();
+      setFilesMenu(open, focusButton);
     };
     filesButton.addEventListener('click', () => setMenu(Boolean(filesMenu.hidden)));
-    filesMenu.addEventListener('keydown', event => {
-      const enabled = menuItems.filter(item => !item.disabled);
-      const index = enabled.indexOf(document.activeElement as HTMLButtonElement);
-      if (event.key === 'Escape') setMenu(false, true);
-      else if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
-        event.preventDefault();
-        enabled[(index + (event.key === 'ArrowDown' ? 1 : enabled.length - 1)) % enabled.length]?.focus();
-      } else return;
-      event.stopPropagation();
+
+    // The Load menu: the manual checkpoint and the autosaves, newest first, read from storage each time it opens.
+    const loadMenu = target.querySelector<HTMLElement>('#load-menu')!;
+    const setLoadMenu = dropDown(loadButton, loadMenu);
+    const savedTime = (savedAt?: number) => {
+      if (savedAt === undefined) return '';
+      const minutes = Math.round((Date.now() - savedAt) / 60_000);
+      const ago = minutes < 1 ? 'just now' : `${minutes} min ago`;
+      return ` · ${ago} (${new Date(savedAt).toLocaleTimeString()})`;
+    };
+    const loadItem = (text: string, onClick?: () => void) => {
+      const item = document.createElement('button');
+      item.type = 'button';
+      item.setAttribute('role', 'menuitem');
+      item.textContent = text;
+      if (onClick) item.addEventListener('click', () => { setLoadMenu(false, true); onClick(); });
+      else item.disabled = true;
+      return item;
+    };
+    loadButton.addEventListener('click', () => {
+      if (!loadMenu.hidden) {
+        setLoadMenu(false);
+        return;
+      }
+      listCheckpoints().then(({ manual, autosaves }) => {
+        loadMenu.replaceChildren(
+          manual ? loadItem(`Manual checkpoint${savedTime(manual.savedAt)}`, () => { void loadCheckpoint(manual.key, 'the checkpoint'); })
+            : loadItem('No manual checkpoint'),
+          ...autosaves.map((entry, index) => loadItem(`Autosave ${index + 1}${savedTime(entry.savedAt)}`,
+            () => { void loadCheckpoint(entry.key, `autosave ${index + 1}`); })),
+          ...(autosaves.length === 0 ? [loadItem('No autosaves yet')] : [])
+        );
+        setLoadMenu(true);
+      }, (error: unknown) => {
+        checkpointStatus.textContent = error instanceof Error ? error.message : 'Checkpoint storage is unavailable.';
+      });
     });
-    document.addEventListener('click', event => {
-      if (!filesMenu.hidden && !(event.target as Element).closest('.save-files')) setMenu(false);
-    }, { signal });
+
     downloadItem.addEventListener('click', () => {
       setMenu(false, true);
       void busy('Preparing save file...', async () => {
@@ -813,8 +957,7 @@ class GameScreen {
         return `Loaded ${file.name}.`;
       });
     });
-    saveButton.addEventListener('click', () => { void persist(true); });
-    loadButton.addEventListener('click', () => { void persist(false); });
+    saveButton.addEventListener('click', () => { void saveCheckpoint(); });
     target.querySelector('#run-forth-boot')?.addEventListener('click', play);
     autoEga?.addEventListener('change', play);
     skipIntro?.addEventListener('change', play);

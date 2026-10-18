@@ -407,7 +407,7 @@ html, body {
   text-align: center;
 }
 
-/* Game tab: the "Save files" drop-down next to Save and Load. */
+/* Game tab: the Load and "Save files" drop-downs next to Save. */
 .save-files {
   position: relative;
 }
@@ -440,6 +440,7 @@ html, body {
   font: inherit;
   font-size: 12px;
   text-align: left;
+  white-space: nowrap;
   cursor: pointer;
 }
 
